@@ -1,0 +1,303 @@
+[
+  {
+    "part_name": "Voltage regulators (linear, SMPS, etc.)",
+    "entries": [
+      {
+        "description": "Hardware part/subpart that maintains the voltage of a power source within a prescribed range that can be tolerated by elements using that voltage.",
+        "modes": [
+          "Output voltage higher than a high threshold of the prescribed range (i.e. over voltage — OV)",
+          "Output voltage lower than a low threshold of the prescribed range (i.e. under voltage — UV)",
+          "Output voltage affected by spikesb",
+          "Incorrect start-up time (i.e. outside the expected range)",
+          "Output voltage accuracy too low, including driftc",
+          "Output voltage oscillation within the prescribed range",
+          "Output voltage affected by a fast oscillation outside the prescribed range but with average value within the prescribed range",
+          "Quiescent current (i.e. current drawn by the regulator in order to control its internal circuitry for proper operation) exceeding the maximum value"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Charge pump, regulator boost",
+    "entries": [
+      {
+        "description": "Hardware part/subpart that converts, and optionally regulates, voltages using switching technology and capacitive-energy storage elements, and maintains a constant output voltage with a varying",
+        "modes": [
+          "Output voltage higher than a high threshold of the prescribed range (i.e. over voltage — OV)",
+          "Output voltage lower than a low threshold of the prescribed range (i.e. under voltage — UV)",
+          "Output voltage affected by spikesb",
+          "Incorrect start-up time (i.e. outside the expected range)",
+          "Quiescent current (i.e. current drawn by the regulator in order to control its internal circuitry for proper operation) exceeding the maximum value"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "High-side/Low-side",
+    "entries": [
+      {
+        "description": "voltage input. Hardware part/subpart that applies voltage to a load in a single direction: high side driver to connect the load to high rail, low side driver to connect the load to",
+        "modes": [
+          "HS/LS driver is stuck in ON or OFF state",
+          "HS/LS driver is floating (i.e. open circuit, tri-stated)",
+          "HS/LS driver resistance too high when turned on",
+          "HS/LS driver resistance too low when turned off",
+          "HS/LS driver turn-on time too fast or too slow"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Half-bridge driver or full-bridge (H-bridge) driver",
+    "entries": [
+      {
+        "description": "Hardware part/subpart that can apply voltage across a load in either direction. A half-bridge driver is built with two drivers (one HS and one LS driver). An H-bridge (or fullbridge) driver is built with four drivers (two HS and two LS drivers)",
+        "modes": [
+          "HS/LS driver is stuck in ON or OFF state",
+          "HS/LS driver is floating (i.e. open circuit, tri-stated)",
+          "HS/LS driver ON resistance too high when turned on",
+          "HS/LS driver OFF resistance too low when turned off",
+          "HS/LS driver turn-on time too fast or too slow",
+          "HS/LS driver turn-off time too fast or too slow",
+          "‘Dead time’ is too short (i.e. when turning off high-side driver and turning on low-side driver, or when turning off low-side driver and turning on high-side driver)",
+          "‘Dead time’ is too long"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "High-side/Low-side pre-driver",
+    "entries": [
+      {
+        "description": "Hardware part/subpart driving a gate of an external FET that is used as a HS or LS driver.",
+        "modes": [
+          "HS/LS pre-driver is stuck in ON or OFF states",
+          "HS/LS pre-driver output voltage/current too high or too low",
+          "HS/LS pre-driver is floating (i.e. open circuit, tri-stated)",
+          "HS/LS pre-driver slew rate too slow or too fast"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "N bits digital to analogue converters (DAC)d",
+    "entries": [
+      {
+        "description": "Hardware part/subpart converting digital data coded on “N bits” into an analogue signal (voltage or current).",
+        "modes": [
+          
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Offset error (not including stuck or floating conditions on the outputs, low resolution)",
+          "Linearity error with monotonic conversion curve not including stuck or floating conditions on the outputs, low resolution",
+          "Full-scale gain-error not including stuck or floating conditions on the outputs, low resolution",
+          "No monotonic conversion curve",
+          "Incorrect settling time (i.e. outside the expected range)",
+          "Oscillationa of the output signal including driftc"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "N bits analogue to digital converters (N-bit ADC)",
+    "entries": [
+      {
+        "description": "Hardware part/subpart converting a continuous-time and continuous-amplitude analogue signal (i.e. a voltage value) to a discrete-time and discrete-amplitude digital signal coded on “N bits.”",
+        "modes": [
+          "One or more outputs are stuck (i.e. high or low)",
+          "One or more outputs are floating (i.e. open circuit)",
+          "Accuracy error (i.e. Error exceeds the LSBs)",
+          "Offset error not including stuck or floating conditions on the outputs, low resolution",
+          "No monotonic conversion characteristic (i.e. given two input analogue voltage V1>V2, the correspondent digital values are D1<D2)",
+          "Full-scale error not including stuck or floating conditions on the outputs, low resolution",
+          "Linearity error with monotonic conversion curve not including stuck or floating conditions on the outputs, low resolution",
+          "Incorrect settling time (i.e. outside the expected range)"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Oscillator",
+    "entries": [
+      {
+        "description": "Hardware part/subpart generating a periodic, oscillating signal. It can be used as a clock in a digital circuit.",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect output signal swing (i.e. outside the expected range)",
+          "Incorrect frequency of the output signal (i.e. outside the expected range, including harmonics when applicable, for instance EMC emissions)",
+          "Incorrect duty cycle of the output signal (i.e. outside the expected range)",
+          "Driftc of the output frequency",
+          "Jitter too high in the output signal"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Phase locked loop (PLL)",
+    "entries": [
+      {
+        "description": "Hardware part/subpart controlling an oscillator in order to generate a square wave signal that maintains a constant phase angle (i.e. lock) on the frequency of an input, or reference signal. It can be used as clock in a digital circuit.",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect frequency of the output signal (i.e. outside the expected range, including harmonics when applicable, e.g.",
+          "EMC emissions)",
+          "Incorrect duty cycle of the output signal (i.e. outside the expected range)",
+          "Drift of the output frequency",
+          "Jitter too high in the output signal",
+          "Loss of lock condition (i.e. phase error, output clock not in sync with input clock not leading to incorrect frequency and incorrect duty cycle)",
+          "Missing pulse in the output signal",
+          "Extra pulse in the output signal"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Operational amplifier and buffer",
+    "entries": [
+      {
+        "description": "Hardware part/subpart integrating a DC-coupled high-gain voltage amplifier with a differential input and, usually, a single-ended output.",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect gain on the output voltage (i.e. outside the expected range)",
+          "Incorrect offset on the output voltage (i.e. outside the expected range)",
+          "Incorrect output dynamic range (i.e. outside the expected range)",
+          "Incorrect input dynamic range (i.e. outside the expected range)",
+          "Output voltage accuracy too low, including drift",
+          "Output voltage affected by spikes b",
+          "Output voltage oscillation a"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Analogue switch",
+    "entries": [
+      {
+        "description": "Hardware part/subpart capable of switching or routing analogue signals based on the level of a digital control signal. Commonly implemented using a \"transmission gate”.",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit or tri-stated)",
+          "Offset too high affecting the output signal",
+          "Resistive or capacitive coupling between control signal and output signal including crosstalk",
+          "Attenuation of the output signal",
+          "Drift c affecting the output signal b",
+          "Spikes b affecting the output signal , e.g. during switching"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Voltage/Current comparator",
+    "entries": [
+      {
+        "description": "Hardware part/subpart comparing an input analogue signal with a predefined threshold (i.e. voltage or current constant value) and producing a binary signal at the output; the output depends on which is higher between the input signal and the threshold and it remains constant as the",
+        "modes": [
+          "Voltage/Current comparator not triggering when expected",
+          "Voltage/Current comparator falsely triggering",
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open)",
+          "Oscillation of the output"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Sample & hold",
+    "entries": [
+      {
+        "description": "Hardware part/subpart sampling the voltage of a continuously varying analogue input signal and holding its value at a constant level for a specified minimum period of time.",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect sampling leading to gain/offset error on output voltage dependent on input signal",
+          "Incorrect gain on the output voltage (i.e. outside the expected range)",
+          "Incorrect offset on the output voltage (i.e. outside the expected range)",
+          "Incorrect output dynamic range (i.e. outside the expected range)",
+          "Incorrect input dynamic range (i.e. outside the expected range)",
+          "Output voltage accuracy too low during hold phase, including drift",
+          "Output voltage during hold phase affected by spikes",
+          "Output voltage oscillation during hold phase",
+          "Output does not settle sufficiently accurate during hold time"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Analogue multiplexer",
+    "entries": [
+      {
+        "description": "Hardware part/subpart consisting of multiple analogue input signals, multiple control inputs and one output signal.",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect channel selection",
+          "Offset affecting the output signal too high",
+          "Resistive or capacitive coupling among input channels and output signal including crosstalk",
+          "Resistive or capacitive coupling among selectors and output signal including crosstalk",
+          "Incorrect output dynamic range (i.e. outside the expected range)",
+          "Attenuation of the output signal",
+          "Drift c affecting the output signal",
+          "Spikes b affecting the output signal (i.e. during switching)"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Voltage references",
+    "entries": [
+      {
+        "description": "Hardware part/subpart producing a constant DC (direct-current) output voltage regardless of variations in external conditions such as temperature, barometric pressure, humidity, current demand, or the",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect output voltage value (i.e. outside the expected range)",
+          "Output voltage accuracy too low, including drift c",
+          "Output voltage affected by spikes",
+          "Output voltage oscillation within the expected range",
+          "Incorrect start-up time (i.e. outside the expected range)"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Passive network",
+    "entries": [
+      {
+        "description": "passage of time. Hardware part/subpart consisting of a network of passive devices (resistor and capacitor) providing a specific low pass transfer function",
+        "modes": [
+          "Output is stuck (i.e. high or low)",
+          "Output is floating (i.e. open circuit)",
+          "Incorrect output dynamic range (i.e. outside the expected range)",
+          "Incorrect attenuation of the output signal (i.e. outside the expected range)",
+          "Incorrect settling time (i.e. outside the expected range)",
+          "Drift c affecting the output signal",
+          "Oscillation a affecting the output signal (i.e. due to crosstalk, coupling or parasitic effects)",
+          "Spikes b affecting the output (i.e. due to crosstalk, coupling or parasitic effects)"
+        ]
+      }
+    ]
+  },
+  {
+    "part_name": "Current source (including bias current generator)",
+    "entries": [
+      {
+        "description": "Hardware part/subpart delivering or absorbing a current (i.e. reference current) which is independent of the voltage across it. It typically includes multiple branches which are routed to other circuits requiring a reference or bias current.",
+        "modes": [
+          "One or more outputs are stuck (i.e. high or low)",
+          "One or more outputs are floating (i.e. open circuit)",
+          "Incorrect reference current (i.e. outside the expected range)",
+          "Reference current accuracy too low , including drift",
+          "Reference current affected by spikes b",
+          "Reference current oscillation a within the expected range",
+          "One or more branch currents outside the expected range while reference current is correct",
+          "One or more branch currents accuracy too low , including drift c",
+          "One or more branch currents affected by spikes b",
+          "One or more branch currents oscillationa within the expected range"
+        ]
+      }
+    ]
+  }
+]
