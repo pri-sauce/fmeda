@@ -52,7 +52,44 @@ def extract_blocks(all_sheets, sheet_name):
     return blocks
 
 
-# ── STEP 3: Load PDF failure modes ───────────────────────────────────────────
+# ── DESCRIPTION PATCHES ──────────────────────────────────────────────────────
+# Some PDF entries have broken/truncated descriptions due to PDF extraction overflow.
+# Patch them here with correct descriptions from the IEC standard.
+DESCRIPTION_PATCHES = {
+    "High-side/Low-side (HS/LS) driver": (
+        "Hardware part/subpart that applies voltage to a load in a single direction. "
+        "A high-side driver connects the load to the high voltage rail. "
+        "A low-side driver connects the load to the ground rail. "
+        "Used to switch power to a load such as a motor, LED, solenoid, etc."
+    ),
+    "High-side/Low-side": (
+        "Hardware part/subpart that applies voltage to a load in a single direction. "
+        "A high-side driver connects the load to the high voltage rail. "
+        "A low-side driver connects the load to the ground rail."
+    ),
+    "Charge pump, regulator boost": (
+        "Hardware part/subpart that converts, and optionally regulates, voltages using "
+        "switching technology and capacitive-energy storage elements, and maintains a "
+        "constant output voltage with a varying voltage input."
+    ),
+    "High-side/Low-side pre-driver": (
+        "Hardware part/subpart driving a gate of an external FET that is used as a "
+        "high-side or low-side driver. Controls the switching of external power transistors."
+    ),
+}
+
+def patch_pdf_modes(pdf_modes):
+    """Fix truncated descriptions in PDF extracted data."""
+    for part in pdf_modes:
+        name = part.get("part_name", "")
+        if name in DESCRIPTION_PATCHES:
+            for entry in part.get("entries", []):
+                desc = entry.get("description", "")
+                # If description looks truncated (starts mid-sentence or is very short)
+                if not desc or desc[0].islower() or len(desc) < 30:
+                    entry["description"] = DESCRIPTION_PATCHES[name]
+                    print(f"  [PATCHED] Description fixed for: {name}")
+    return pdf_modes
 def load_pdf_modes(filepath):
     with open(filepath, 'r', encoding='utf-8-sig') as f:
         return json.load(f)
@@ -71,62 +108,74 @@ def query_ollama(prompt, model):
 
 
 def match_failure_modes(block, pdf_modes, model):
-    # Build a clean categorized reference from the PDF
+    # Build enriched reference organized by part type
     pdf_by_part = []
     for part in pdf_modes:
         entries = part.get("entries", [])
         all_modes = []
+        descriptions = []
         for entry in entries:
             all_modes.extend(entry.get("modes", []))
+            d = entry.get("description", "").strip()
+            if d and d not in descriptions:
+                descriptions.append(d)
         if all_modes:
             pdf_by_part.append({
                 "part_type": part["part_name"],
-                "description": entries[0].get("description", "") if entries else "",
+                "what_it_is": " ".join(descriptions),
                 "standard_failure_modes": all_modes
             })
 
-    prompt = f"""You are a senior functional safety engineer performing FMEDA (Failure Mode Effects and Diagnostic Analysis) for an automotive IC, following IEC 60748-5 standard.
-
-## YOUR TASK
-Determine the applicable standard failure modes for the following IC block.
+    prompt = f"""You are a senior functional safety engineer with 15+ years experience in automotive IC design and FMEDA analysis (IEC 26262, IEC 60748-5).
 
 ## BLOCK TO ANALYZE
-- **Block Name**: {block['block_name']}
-- **Block Function**: {block['function']}
+- Block Name: {block['block_name']}
+- Block Function: {block['function']}
 
-## STEP-BY-STEP REASONING INSTRUCTIONS
-You must follow this exact reasoning process before giving your answer:
-
-STEP 1 - UNDERSTAND THE BLOCK:
-  Read the block's function carefully. What does it do electrically?
-  What is its primary output? (voltage, current, digital signal, clock, etc.)
-  What kind of circuit is it fundamentally? (reference, oscillator, amplifier, comparator, DAC, driver, etc.)
-
-STEP 2 - IDENTIFY THE CIRCUIT CATEGORY:
-  Match this block to the most appropriate part type(s) from the IEC standard list below.
-  A block may match MORE THAN ONE part type (e.g. a "Bandgap Reference" is both a voltage reference AND produces a current, so consider both).
-  Do not just match on name — match on FUNCTION.
-
-STEP 3 - FILTER MODES BY RELEVANCE:
-  For each candidate failure mode, ask:
-  - Can this block physically exhibit this failure? (e.g. if it has no output clock, "incorrect duty cycle" doesn't apply)
-  - Would this failure mode affect the block's PRIMARY function?
-  - Is this mode already covered by a more specific mode in the list?
-  Exclude modes that are clearly irrelevant to this block's function.
-  Include modes that affect the block's output signal type (voltage/current/digital).
-
-STEP 4 - OUTPUT ONLY THE FINAL LIST:
-  Return a JSON array of applicable standard failure mode strings.
-  No numbering, no explanation in the output — just the JSON array.
-
-## IEC STANDARD FAILURE MODES REFERENCE (organized by part type):
+## IEC STANDARD PART TYPES AND THEIR FAILURE MODES
 {json.dumps(pdf_by_part, indent=2)}
 
-## OUTPUT FORMAT
-Return ONLY a valid JSON array of strings. No markdown, no explanation, no preamble.
-Example: ["Output is stuck (i.e. high or low)", "Output is floating (i.e. open circuit)"]
+## HOW A HUMAN EXPERT DOES THIS ANALYSIS
+Follow these exact steps, think carefully at each one:
 
-Think through all 4 steps carefully, then output only the final JSON array."""
+### STEP 1 — Understand the block's electrical nature
+Ask yourself:
+- What does this block OUTPUT? (stable voltage, current, clock signal, digital bits, drive current to load, etc.)
+- What is its core circuit topology? (bandgap = voltage reference + current source, oscillator = generates clock, DAC = digital to analog, driver = switches power to load, comparator = threshold detection, etc.)
+- Does it have an analog output, digital output, or both?
+- Can it drive a load directly, or does it just provide a signal/reference?
+
+### STEP 2 — Map to IEC part type(s) by FUNCTION not by NAME
+- Do NOT match by name similarity alone (e.g. "Current DAC" is a DAC, not just a "current source")
+- Match by what the block DOES electrically
+- A single block may map to MULTIPLE IEC part types (e.g. a block with both analog output and clock output needs modes from both)
+- For driver blocks (HS/LS, pre-driver, H-bridge): focus on switching behavior, stuck states, resistance, timing
+- For reference blocks (bandgap, bias): focus on output voltage/current accuracy, stuck, floating, drift
+- For oscillator/PLL/clock blocks: focus on frequency, duty cycle, jitter, stuck, missing pulses
+- For ADC/DAC blocks: focus on accuracy, linearity, stuck outputs, settling time
+- For comparator blocks: focus on false triggering, no triggering, stuck output, oscillation
+- For digital/logic blocks (SPI, watchdog, registers): these may NOT map to analog failure modes at all — be honest if no modes apply
+
+### STEP 3 — For EACH candidate failure mode, ask these filter questions
+Only include a mode if ALL of these are true:
+1. Can this block physically exhibit this behavior given its circuit topology?
+2. Does this mode affect the block's PRIMARY function or output?
+3. Is the mode meaningful — not redundant with another already included mode?
+4. Would a safety engineer actually list this in an FMEDA for this block type?
+
+### STEP 4 — Special rules
+- If the block is a DRIVER (switches current/voltage to a load): always consider stuck ON/OFF, floating, resistance too high/low, turn-on/off timing
+- If the block is a REFERENCE or BIAS generator: always consider stuck output, floating, out-of-range voltage/current, drift, quiescent current
+- If the block is an OSCILLATOR or CLOCK: always consider stuck, incorrect frequency, duty cycle, jitter, drift
+- If the block is purely DIGITAL (SPI, register, logic): do not force-fit analog modes — return empty array [] if none apply
+- If the block name contains "×N" (e.g. ×10), it means there are N identical instances — treat it as one instance for failure mode purposes
+
+### STEP 5 — Output
+Return ONLY a valid JSON array of the applicable standard failure mode strings from the IEC list above.
+Copy the mode strings EXACTLY as written in the IEC list. Do not paraphrase or invent new modes.
+No explanation, no markdown, no preamble — just the raw JSON array.
+
+If no modes apply, return: []"""
 
     raw = query_ollama(prompt, model)
 
@@ -204,6 +253,7 @@ if __name__ == '__main__':
 
     print("\n=== Step 3: Loading PDF failure modes ===")
     pdf_modes = load_pdf_modes(PDF_MODES_FILE)
+    pdf_modes = patch_pdf_modes(pdf_modes)
     print(f"Loaded {len(pdf_modes)} parts from PDF")
 
     print(f"\n=== Step 4: Querying LLM ({OLLAMA_MODEL}) ===")
