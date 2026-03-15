@@ -1,45 +1,42 @@
 """
 fmeda_writer.py
 
-Fills FMEDA_TEMPLATE.xlsx with data from the JSON pipeline output.
-Writes ONLY the FMEDA sheet. All other sheets and formulas are preserved.
+Stage 3 of the FMEDA pipeline.
+Fills FMEDA_TEMPLATE.xlsx with data from llm_output_with_effects.json.
+Writes ONLY the FMEDA sheet data rows (row 22 onwards).
+All template headers, styling, and formulas are preserved.
 
-Flow:
-  llm_output_with_effects.json → fmeda_writer.py → FMEDA_filled.xlsx
-
-The template uses {{FMEDA_B22}} style placeholders for header cells (rows 1-21).
-Data rows start at row 22 and follow the same column layout as the real FMEDA.
-
-Column mapping (from real FMEDA analysis):
-  B = Failure Mode Number
-  C = Component Name (same as block name)
-  D = Block Name (only on first row of each block)
-  E = Block Failure rate [FIT] (only on first row, formula-driven)
-  F = Failure mode separate fault rate (formula)
-  G = Standard failure mode
-  H = Failure Mode (same as G for now)
-  I = effects on the IC output
-  J = effects on the system
-  K = memo (X or O)
-  O = Failure distribution (always 1)
-  P = Single Point Failure mode (Y/N)
-  Q = Failure rate [FIT] (formula)
-  R = Percentage of Safe Faults (0 or 1)
-  S = Safety mechanism(s) IC
-  T = Safety mechanism(s) System
-  U = Failure mode coverage SPF
-  V = Residual/SPF failure rate (formula)
-  X = Latent failure mode (Y/N)
-  Y = Safety mechanism(s) IC latent
-  Z = Safety mechanism(s) System latent
-  AA = Failure mode coverage latent
-  AB = Latent Multiple Point Fault rate (formula)
+Column layout (matches real FMEDA exactly):
+  B  = Failure Mode Number        (FM_TTL_1, FM_TTL_2, ...)
+  C  = Component Name             (block name, every row)
+  D  = Block Name                 (first row of each block only)
+  E  = Block Failure rate [FIT]   (first row of each block only)
+  F  = Failure mode separate rate (every row)
+  G  = Standard failure mode
+  H  = Failure Mode               (same as G)
+  I  = Effects on IC output
+  J  = Effects on system
+  K  = Memo (X or O)
+  O  = Failure distribution       (always 1)
+  P  = Single Point Y/N
+  Q  = Failure rate [FIT]
+  R  = Percentage of Safe Faults
+  S  = Safety mechanism(s) IC
+  T  = Safety mechanism(s) System
+  U  = Coverage SPF
+  V  = Residual/SPF FIT
+  X  = Latent failure Y/N
+  Y  = SM IC latent
+  Z  = SM System latent
+  AA = Coverage latent
+  AB = Latent MPF FIT
   AD = Comment
+
+Usage:
+  python fmeda_writer.py
 """
 
-import json
-import shutil
-import openpyxl
+import json, shutil, openpyxl
 from openpyxl.styles import Alignment
 from copy import copy
 
@@ -47,271 +44,230 @@ from copy import copy
 TEMPLATE_FILE  = 'FMEDA_TEMPLATE.xlsx'
 JSON_INPUT     = 'llm_output_with_effects.json'
 OUTPUT_FILE    = 'FMEDA_filled.xlsx'
-DATA_START_ROW = 22   # first data row in template
+DATA_START_ROW = 22
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─── COLUMN MAP ──────────────────────────────────────────────────────────────
-# Maps field name → Excel column letter
-COL = {
-    'failure_mode_number': 'B',
-    'component_name':      'C',
-    'block_name':          'D',   # only first row per block
-    'block_fit':           'E',   # only first row per block
-    'mode_fit':            'F',
-    'standard_failure_mode': 'G',
-    'failure_mode':        'H',   # same as G
-    'ic_output_effect':    'I',
-    'system_effect':       'J',
-    'memo':                'K',   # X or O
-    'system_comment':      'L',
-    'system_request':      'M',
-    'failure_distribution':'O',   # always 1
-    'single_point':        'P',   # Y or N
-    'failure_rate_fit':    'Q',
-    'pct_safe_faults':     'R',
-    'sm_ic':               'S',
-    'sm_system':           'T',
-    'coverage_spf':        'U',
-    'residual_fit':        'V',
-    'latent_yesno':        'X',
-    'sm_ic_latent':        'Y',
-    'sm_system_latent':    'Z',
-    'coverage_latent':     'AA',
-    'latent_fit':          'AB',
-    'comment':             'AD',
-}
-
-def col_letter(letter):
-    """Convert column letter to 1-based index."""
+def col_idx(letter):
+    """Excel column letter(s) → 1-based column index."""
     result = 0
     for c in letter.upper():
         result = result * 26 + (ord(c) - ord('A') + 1)
     return result
 
 
-# ─── STYLE HELPERS ───────────────────────────────────────────────────────────
-
-def copy_style(src_cell, dst_cell):
-    """Copy cell style from source to destination."""
-    if src_cell.has_style:
-        dst_cell.font      = copy(src_cell.font)
-        dst_cell.fill      = copy(src_cell.fill)
-        dst_cell.border    = copy(src_cell.border)
-        dst_cell.alignment = copy(src_cell.alignment)
-        dst_cell.number_format = src_cell.number_format
-
-
-def set_cell(ws, row, col_letter_str, value, wrap=False, src_style_cell=None):
-    """Set a cell value and optionally copy style."""
-    cell = ws.cell(row=row, column=col_letter(col_letter_str))
+def set_cell(ws, row, col_letter, value, wrap=True, style_ref=None):
+    """Write value to cell, skipping merged cells, optionally copying style."""
+    if value is None or value == '':
+        return
+    cell = ws.cell(row=row, column=col_idx(col_letter))
+    if cell.__class__.__name__ == 'MergedCell':
+        return  # skip — merged cells can't be written directly
     cell.value = value
-    if src_style_cell:
-        copy_style(src_style_cell, cell)
+    if style_ref and style_ref.__class__.__name__ != 'MergedCell' and style_ref.has_style:
+        cell.font      = copy(style_ref.font)
+        cell.fill      = copy(style_ref.fill)
+        cell.border    = copy(style_ref.border)
+        cell.number_format = style_ref.number_format
     if wrap:
         cell.alignment = Alignment(wrap_text=True, vertical='top')
-    elif cell.alignment:
-        cell.alignment = Alignment(
-            wrap_text=cell.alignment.wrap_text,
-            vertical=cell.alignment.vertical or 'top',
-            horizontal=cell.alignment.horizontal
-        )
+    else:
+        cell.alignment = Alignment(wrap_text=False, vertical='top')
 
 
-# ─── TEMPLATE FILLER ─────────────────────────────────────────────────────────
+def get_style_refs(ws, start_row, max_search=10):
+    """
+    For each column we write, find the first non-merged cell at or after start_row
+    to use as a style reference.
+    """
+    cols = ['B','C','D','E','F','G','H','I','J','K','O','P','Q','R',
+            'S','T','U','V','X','Y','Z','AA','AB','AD']
+    refs = {}
+    for c in cols:
+        ref = None
+        for r in range(start_row, start_row + max_search):
+            cell = ws.cell(row=r, column=col_idx(c))
+            if cell.__class__.__name__ != 'MergedCell':
+                ref = cell
+                break
+        refs[c] = ref  # may be None if all merged (rare)
+    return refs
+
 
 def fill_template(template_path, json_path, output_path):
-    # Load JSON
     with open(json_path, 'r', encoding='utf-8-sig') as f:
         data = json.load(f)
 
-    # Copy template to output
     shutil.copy2(template_path, output_path)
     wb = openpyxl.load_workbook(output_path)
     ws = wb['FMEDA']
 
-    # Clear placeholder values in header rows (rows 1-21) — keep {{}} cells as-is
-    # (they'll be populated by the application layer, not us)
+    # Collect style references from template row 22 before clearing
+    style_refs = get_style_refs(ws, DATA_START_ROW)
 
-    # Get style from template row 22 to use for new rows
-    template_row_22 = {
-        col: ws.cell(row=22, column=col_letter(col))
-        for col in ['B','C','D','E','F','G','H','I','J','K','O','P','Q','R','S','T','U','V','X','Y','Z','AA','AB','AD']
-    }
-
-    # Clear existing data rows (row 22 onwards) — skip merged cells
-    for row_num in range(DATA_START_ROW, ws.max_row + 1):
-        for col_num in range(1, ws.max_column + 1):
-            cell = ws.cell(row=row_num, column=col_num)
+    # Clear all data rows — skip merged cells
+    for r in range(DATA_START_ROW, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=c)
             if cell.__class__.__name__ != 'MergedCell':
                 cell.value = None
 
-    # Write data
     current_row = DATA_START_ROW
-    fm_counter  = 1  # global failure mode number counter
+    fm_counter  = 1
 
     for block in data:
-        block_name = block['block_name']
-        function   = block.get('function', '')
+        block_name = block.get('block_name', '')
         rows       = block.get('rows', [])
-
         if not rows:
             continue
 
         for idx, row in enumerate(rows):
             is_first = (idx == 0)
-            mode = row.get('Standard failure mode', '')
-            effect_ic = row.get('effects on the IC output', 'No effect')
-            effect_sys = row.get('effects on the system', '')
-            memo = row.get('memo', '')
-            fd = row.get('Failure distribution', 1)
-            sp = row.get('Single Point Failure mode', '')
-            fit = row.get('Failure rate [FIT]', '')
-            pct_safe = row.get('Percentage of Safe Faults', '')
-            sm_ic = row.get('Safety mechanism(s) (IC) allowing to prevent the violation of the safety goal', '')
-            sm_sys = row.get('Safety mechanism(s) (System) allowing to prevent the violation of the safety goal', '')
-            cov_spf = row.get('Failure mode coverage wrt. violation of safety goal', '')
-            res_fit = row.get('Residual or Single Point Fault failure rate [FIT]', '')
-            latent = row.get('Latent Failure mode', '')
-            sm_ic_lat = row.get('Safety mechanism(s) (IC) to prevent latent faults', '')
-            sm_sys_lat = row.get('Safety mechanism(s) (System) to prevent latent faults', '')
-            cov_lat = row.get('Failure mode coverage wrt. Latent failures', '')
-            lat_fit = row.get('Latent Multiple Point Fault failure rate [FIT]', '')
-            comment = row.get('comment', '')
-            block_fit = row.get('Block Failure rate [FIT]', '')
+            mode     = row.get('Standard failure mode', '')
+            s        = style_refs  # shorthand
 
-            # Get style reference from template row 22
-            style_src = template_row_22
-
-            # B: Failure Mode Number
+            # ── B: Failure Mode Number ───────────────────────────────────────
             set_cell(ws, current_row, 'B', f'FM_TTL_{fm_counter}',
-                     src_style_cell=style_src.get('B'))
+                     wrap=False, style_ref=s['B'])
 
-            # C: Component Name (same as block name)
+            # ── C: Component Name (every row) ────────────────────────────────
             set_cell(ws, current_row, 'C', block_name,
-                     src_style_cell=style_src.get('C'))
+                     wrap=False, style_ref=s['C'])
 
-            # D: Block Name — only on first row
+            # ── D: Block Name (first row only) ───────────────────────────────
             if is_first:
                 set_cell(ws, current_row, 'D', block_name,
-                         src_style_cell=style_src.get('D'))
+                         wrap=False, style_ref=s['D'])
 
-            # E: Block FIT — only on first row
-            if is_first and block_fit:
-                set_cell(ws, current_row, 'E', block_fit,
-                         src_style_cell=style_src.get('E'))
+            # ── E: Block FIT (first row only) ────────────────────────────────
+            if is_first:
+                v = row.get('Block Failure rate [FIT]', '')
+                if v != '':
+                    set_cell(ws, current_row, 'E', v,
+                             wrap=False, style_ref=s['E'])
 
-            # F: Mode FIT (leave empty — formula driven in real file)
-            if fit:
-                set_cell(ws, current_row, 'F', fit,
-                         src_style_cell=style_src.get('F'))
+            # ── F: Mode FIT (every row) ──────────────────────────────────────
+            v = row.get('Failure rate [FIT]', '')
+            if v != '':
+                set_cell(ws, current_row, 'F', v,
+                         wrap=False, style_ref=s['F'])
 
-            # G: Standard failure mode
-            set_cell(ws, current_row, 'G', mode, wrap=True,
-                     src_style_cell=style_src.get('G'))
+            # ── G: Standard failure mode ─────────────────────────────────────
+            set_cell(ws, current_row, 'G', mode,
+                     wrap=True, style_ref=s['G'])
 
-            # H: Failure Mode (same as G)
-            set_cell(ws, current_row, 'H', mode, wrap=True,
-                     src_style_cell=style_src.get('H'))
+            # ── H: Failure Mode (same as G) ──────────────────────────────────
+            set_cell(ws, current_row, 'H', mode,
+                     wrap=True, style_ref=s['H'])
 
-            # I: Effects on IC output
-            set_cell(ws, current_row, 'I', effect_ic, wrap=True,
-                     src_style_cell=style_src.get('I'))
+            # ── I: Effects on IC output ──────────────────────────────────────
+            set_cell(ws, current_row, 'I',
+                     row.get('effects on the IC output', 'No effect'),
+                     wrap=True, style_ref=s['I'])
 
-            # J: Effects on system
-            set_cell(ws, current_row, 'J', effect_sys, wrap=True,
-                     src_style_cell=style_src.get('J'))
+            # ── J: Effects on system ─────────────────────────────────────────
+            set_cell(ws, current_row, 'J',
+                     row.get('effects on the system', 'No effect'),
+                     wrap=True, style_ref=s['J'])
 
-            # K: Memo (X or O)
+            # ── K: Memo (X or O) ─────────────────────────────────────────────
+            memo = row.get('memo', 'O')
             set_cell(ws, current_row, 'K', memo,
-                     src_style_cell=style_src.get('K'))
+                     wrap=False, style_ref=s['K'])
 
-            # O: Failure distribution
-            set_cell(ws, current_row, 'O', fd if fd != '' else 1,
-                     src_style_cell=style_src.get('O'))
+            # ── O: Failure distribution (always 1) ───────────────────────────
+            set_cell(ws, current_row, 'O', 1,
+                     wrap=False, style_ref=s['O'])
 
-            # P: Single Point
-            if sp:
-                set_cell(ws, current_row, 'P', sp,
-                         src_style_cell=style_src.get('P'))
+            # ── P: Single Point Y/N ──────────────────────────────────────────
+            sp = row.get('Single Point Failure mode', 'N' if memo == 'O' else 'Y')
+            set_cell(ws, current_row, 'P', sp,
+                     wrap=False, style_ref=s['P'])
 
-            # Q: Failure rate
-            if fit:
-                set_cell(ws, current_row, 'Q', fit,
-                         src_style_cell=style_src.get('Q'))
+            # ── Q: Failure rate FIT ──────────────────────────────────────────
+            v = row.get('Failure rate [FIT]', '')
+            if v != '':
+                set_cell(ws, current_row, 'Q', v,
+                         wrap=False, style_ref=s['Q'])
 
-            # R: Pct safe faults
-            if pct_safe != '':
-                set_cell(ws, current_row, 'R', pct_safe,
-                         src_style_cell=style_src.get('R'))
+            # ── R: Percentage of Safe Faults ─────────────────────────────────
+            pct = row.get('Percentage of Safe Faults', 1 if memo == 'O' else 0)
+            set_cell(ws, current_row, 'R', pct,
+                     wrap=False, style_ref=s['R'])
 
-            # S: SM IC
+            # ── S: Safety mechanism(s) IC ────────────────────────────────────
+            sm_ic = row.get('Safety mechanism(s) (IC) allowing to prevent the violation of the safety goal', '')
             if sm_ic:
-                set_cell(ws, current_row, 'S', sm_ic, wrap=True,
-                         src_style_cell=style_src.get('S'))
+                set_cell(ws, current_row, 'S', sm_ic,
+                         wrap=True, style_ref=s['S'])
 
-            # T: SM System
+            # ── T: Safety mechanism(s) System ────────────────────────────────
+            sm_sys = row.get('Safety mechanism(s) (System) allowing to prevent the violation of the safety goal', '')
             if sm_sys:
-                set_cell(ws, current_row, 'T', sm_sys, wrap=True,
-                         src_style_cell=style_src.get('T'))
+                set_cell(ws, current_row, 'T', sm_sys,
+                         wrap=True, style_ref=s['T'])
 
-            # U: Coverage SPF
-            if cov_spf != '':
-                set_cell(ws, current_row, 'U', cov_spf,
-                         src_style_cell=style_src.get('U'))
+            # ── U: Coverage SPF ──────────────────────────────────────────────
+            v = row.get('Failure mode coverage wrt. violation of safety goal', '')
+            if v != '':
+                set_cell(ws, current_row, 'U', v,
+                         wrap=False, style_ref=s['U'])
 
-            # V: Residual FIT
-            if res_fit != '':
-                set_cell(ws, current_row, 'V', res_fit,
-                         src_style_cell=style_src.get('V'))
+            # ── V: Residual/SPF FIT ──────────────────────────────────────────
+            v = row.get('Residual or Single Point Fault failure rate [FIT]', '')
+            if v != '':
+                set_cell(ws, current_row, 'V', v,
+                         wrap=False, style_ref=s['V'])
 
-            # X: Latent Y/N
-            if latent:
-                set_cell(ws, current_row, 'X', latent,
-                         src_style_cell=style_src.get('X'))
+            # ── X: Latent failure Y/N ────────────────────────────────────────
+            lat = row.get('Latent Failure mode', 'N' if memo == 'O' else 'Y')
+            set_cell(ws, current_row, 'X', lat,
+                     wrap=False, style_ref=s['X'])
 
-            # Y: SM IC latent
-            if sm_ic_lat:
-                set_cell(ws, current_row, 'Y', sm_ic_lat, wrap=True,
-                         src_style_cell=style_src.get('Y'))
+            # ── Y: SM IC latent ──────────────────────────────────────────────
+            v = row.get('Safety mechanism(s) (IC) to prevent latent faults', '')
+            if v:
+                set_cell(ws, current_row, 'Y', v,
+                         wrap=True, style_ref=s['Y'])
 
-            # Z: SM System latent
-            if sm_sys_lat:
-                set_cell(ws, current_row, 'Z', sm_sys_lat, wrap=True,
-                         src_style_cell=style_src.get('Z'))
+            # ── Z: SM System latent ──────────────────────────────────────────
+            v = row.get('Safety mechanism(s) (System) to prevent latent faults', '')
+            if v:
+                set_cell(ws, current_row, 'Z', v,
+                         wrap=True, style_ref=s['Z'])
 
-            # AA: Coverage latent
-            if cov_lat != '':
-                set_cell(ws, current_row, 'AA', cov_lat,
-                         src_style_cell=style_src.get('AA'))
+            # ── AA: Coverage latent ──────────────────────────────────────────
+            v = row.get('Failure mode coverage wrt. Latent failures', '')
+            if v != '':
+                set_cell(ws, current_row, 'AA', v,
+                         wrap=False, style_ref=s['AA'])
 
-            # AB: Latent FIT
-            if lat_fit != '':
-                set_cell(ws, current_row, 'AB', lat_fit,
-                         src_style_cell=style_src.get('AB'))
+            # ── AB: Latent MPF FIT ───────────────────────────────────────────
+            v = row.get('Latent Multiple Point Fault failure rate [FIT]', '')
+            if v != '':
+                set_cell(ws, current_row, 'AB', v,
+                         wrap=False, style_ref=s['AB'])
 
-            # AD: Comment
-            if comment:
-                set_cell(ws, current_row, 'AD', comment, wrap=True,
-                         src_style_cell=style_src.get('AD'))
+            # ── AD: Comment ──────────────────────────────────────────────────
+            v = row.get('comment', '') or row.get('Comment', '')
+            if v:
+                set_cell(ws, current_row, 'AD', v,
+                         wrap=True, style_ref=s['AD'])
 
             current_row += 1
             fm_counter  += 1
 
-    total_rows = current_row - DATA_START_ROW
-    print(f"  Written {total_rows} rows across {len(data)} blocks")
-    print(f"  Last row used: {current_row - 1}")
-
+    total_data_rows = current_row - DATA_START_ROW
+    print(f"  Wrote {total_data_rows} rows across {len(data)} blocks (last row: {current_row-1})")
     wb.save(output_path)
-    print(f"  Saved to {output_path}")
+    print(f"  Saved → {output_path}")
 
 
 if __name__ == '__main__':
-    print(f"=== Filling FMEDA Template ===")
+    print(f"=== FMEDA Template Filler ===")
     print(f"  Template : {TEMPLATE_FILE}")
     print(f"  Data     : {JSON_INPUT}")
     print(f"  Output   : {OUTPUT_FILE}")
     print()
-
     fill_template(TEMPLATE_FILE, JSON_INPUT, OUTPUT_FILE)
     print("\n✅ Done")
