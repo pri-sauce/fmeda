@@ -16,7 +16,7 @@ OLLAMA_URL        = 'http://localhost:11434/api/generate'
 MAX_PDF_CONTEXT_CHARS = 8000
 # ─────────────────────────────────────────────────────────────────────────────
 
-
+    
 # ═══════════════════════════════════════════════════════════════════════════════
 # GROUND TRUTH KNOWLEDGE BASE
 # Learned from comparing manual analysis against real FMEDA output.
