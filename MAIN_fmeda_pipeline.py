@@ -1,3 +1,4 @@
+
 # """
 # fmeda_agents.py  —  Multi-Agent FMEDA Pipeline
 # ===============================================
@@ -461,6 +462,7 @@
 #   • Block codes: REF  BIAS  LDO  OSC  TEMP  CSNS  ADC  CP  LOGIC  INTERFACE  TRIM  SW_BANK_x
 #   • Effect must be specific — NOT "BIAS is affected" BUT "Output reference voltage is stuck"
 #   • Use present tense: "is stuck", "is incorrect", "cannot operate", "out of spec."
+#   • List EVERY block that receives signal from the failing block — do not omit any
 # """.strip()
 
 # FEW_SHOT = """
@@ -633,66 +635,118 @@
 #     return result
 
 
+# def _build_downstream_hint(block, chip_ctx):
+#     """
+#     Build a text hint about which blocks likely receive signal from this block.
+#     Based on function keywords — helps LLM reason about signal flow.
+#     """
+#     code = block['fmeda_code']
+#     func = (block.get('function') or '').lower()
+#     name = block.get('name', '').lower()
+
+#     # Known downstream relationships
+#     DOWNSTREAM = {
+#         'REF':       'BIAS, ADC, TEMP, LDO, OSC — all use the reference voltage for biasing and regulation',
+#         'BIAS':      'ADC, TEMP, LDO, OSC, SW_BANKx, CP, CSNS — all receive bias currents from BIAS',
+#         'LDO':       'OSC (LDO powers the oscillator supply rail)',
+#         'OSC':       'LOGIC, INTERFACE — clock signal drives all digital logic and communication',
+#         'TEMP':      'ADC (TEMP voltage is read by ADC), SW_BANK_x (DIETEMP controls output enable)',
+#         'CSNS':      'ADC (CSNS output is digitized by ADC for current monitoring)',
+#         'ADC':       'SW_BANK_x (ADC DIETEMP result controls switch enable), LOGIC (ADC results feed decision logic)',
+#         'CP':        'SW_BANK_x (charge pump supplies the gate drive voltage for all switches)',
+#         'LOGIC':     'SW_BANK_X (LOGIC drives all switch banks), OSC (LOGIC can assert reset)',
+#         'INTERFACE': 'LOGIC, ADC (SPI writes configure DAC and read ADC results)',
+#         'TRIM':      'REF, LDO, BIAS, OSC, SW_BANK, DIETEMP — trim data calibrates all analog blocks',
+#     }
+
+#     hint = DOWNSTREAM.get(code, '')
+#     if not hint:
+#         # Generic: suggest looking at all blocks
+#         hint = 'Review all blocks — consider which ones depend on this block output signal'
+#     return hint
+
+
 # def _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms):
 #     code = block['fmeda_code']
 #     name = block['name']
 #     func = block.get('function', '')
 #     n    = len(modes)
 
+#     # Build downstream signal map for this block
+#     # Helps LLM reason about who receives the signal from this block
+#     downstream_hint = _build_downstream_hint(block, chip_ctx)
+
 #     prompt = f"""You are completing an FMEDA table for an automotive IC (ISO 26262 / AEC-Q100).
 
 # {FEW_SHOT}
 
 # ═══════════════════════════════════════════════════
-# ALL BLOCKS IN THIS CHIP:
+# ALL BLOCKS IN THIS CHIP (fmeda_code | name | function):
 # {chip_ctx}
 
-# SYSTEM SAFETY REQUIREMENTS (TSR) — these define what the system must protect:
+# SYSTEM SAFETY REQUIREMENTS (TSR):
 # {tsr_ctx}
 # ═══════════════════════════════════════════════════
 # BLOCK BEING ANALYZED:
 #   FMEDA Code : {code}
 #   Block Name : {name}
 #   Function   : {func}
+
+# SIGNAL FLOW HINT (who likely receives output from this block):
+# {downstream_hint}
 # ═══════════════════════════════════════════════════
-# FAILURE MODES ({n} total):
+# FAILURE MODES TO ANALYZE ({n} total):
 # {json.dumps(modes, indent=2)}
 # ═══════════════════════════════════════════════════
 
-# For EACH failure mode, you must produce:
+# STEP-BY-STEP REASONING FOR EACH MODE:
 
-# col I — "effects on IC output"
-#   REASONING:
-#   1. What does {name} output? (voltage level / current / clock / enable signal / data)
-#   2. Which other blocks in the chip RECEIVE that output as their input?
-#   3. For this specific failure mode, what EXACTLY goes wrong in each receiver?
-#   4. Use the verified examples above as your guide for format and specificity.
+#   Step 1 — IDENTIFY THE OUTPUT SIGNAL
+#     Ask: "What physical signal does {name} produce?"
+#     Examples: reference voltage, bias current, clock signal, PWM enable, serial data, temperature voltage
 
-# col J — "effects on system"
-#   What the end user or ECU observes. Pick the most accurate:
-#     "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
-#     "Fail-safe mode active\\nNo communication"
-#     "Fail-safe mode active"
-#     "Unintended LED ON"
-#     "Unintended LED OFF"
-#     "Unintended LED ON/OFF"
-#     "Device damage"
-#     "No effect"
-#   Cross-check against the TSR requirements above — if a TSR covers this failure, 
-#   the system effect should reflect what that TSR is trying to prevent.
+#   Step 2 — MAP ALL CONSUMERS
+#     Go through EVERY other block in the chip.
+#     For each block ask: "Does its function depend on {name}'s output?"
+#     Be thorough — a bias current affects ADC, TEMP, LDO, OSC, CP all at once.
+#     A reference voltage affects every block that uses it for comparison or regulation.
+#     A clock signal affects all digital blocks.
+
+#   Step 3 — DETERMINE THE SPECIFIC SYMPTOM PER CONSUMER
+#     For each consumer block, describe exactly what goes wrong:
+#     - NOT "ADC is affected" → YES "ADC measurement is incorrect."
+#     - NOT "OSC has issue"   → YES "Oscillation does not start" or "Frequency out of spec."
+#     - NOT "LOGIC fails"     → YES "Cannot operate." + "Communication error."
+
+#   Step 4 — SAFE MODES (always No effect):
+#     If the failure mode is: "affected by spikes", "oscillation within expected range",
+#     "incorrect start-up time", "jitter too high", "incorrect duty cycle",
+#     "quiescent current exceeding", "incorrect settling time"
+#     → col I = "No effect" (these are local disturbances, don't propagate)
+
+#   Step 5 — SYSTEM EFFECT (col J)
+#     What does the end user/ECU observe? Cross-check TSR requirements.
+#     Choose from:
+#       "Unintentional LED ON/OFF\nFail-safe mode active\nNo communication"
+#       "Fail-safe mode active\nNo communication"
+#       "Fail-safe mode active"
+#       "Unintended LED ON"
+#       "Unintended LED OFF"
+#       "Unintended LED ON/OFF"
+#       "Device damage"
+#       "No effect"
 
 # {IC_FORMAT}
 
-# Return a JSON array with EXACTLY {n} objects, in the SAME ORDER as the failure modes:
+# Return a JSON array with EXACTLY {n} objects, same order as failure modes:
 # [
 #   {{
 #     "G": "<exact failure mode string>",
-#     "I": "<col I: IC output effect in bullet format or 'No effect'>",
+#     "I": "<col I: IC output effect>",
 #     "J": "<col J: system effect>"
 #   }},
 #   ...
 # ]
-
 # Return ONLY the JSON array:"""
 
 #     raw    = query_llm(prompt, temperature=0.05)
@@ -714,20 +768,34 @@
 
 
 # def _build_row(canonical_mode, ic, sys_, memo):
-#     # Final consistency check
-#     if ic.strip() in ('No effect', ''):
+#     """
+#     col P  (Single Point Failure mode): Y if K=X, N if K=O
+#     col R  (Percentage of Safe Faults): 0 if IC effect has anything, 1 if "No effect"
+#             — R is expressed as 0 or 1 here; Excel template formats as 0% / 100%
+#     """
+#     # Enforce consistency: No effect → always O
+#     ic_clean = ic.strip()
+#     if ic_clean in ('No effect', ''):
 #         memo = 'O'
-#         sys_ = 'No effect' if sys_.strip() == '' else sys_
+
+#     # col P: Single Point — Y if memo X, N if memo O
+#     sp = 'Y' if memo.startswith('X') else 'N'
+
+#     # col R: Percentage of Safe Faults
+#     #   0%   (value=0) if IC effect is NOT "No effect" (i.e. something is affected)
+#     #   100% (value=1) if IC effect IS "No effect"
+#     pct_safe = 1 if ic_clean == 'No effect' else 0
+
 #     return {
 #         'G': canonical_mode,
 #         'I': ic,
 #         'J': sys_,
 #         'K': memo,
 #         'O': 1,
-#         'P': 'Y' if memo.startswith('X') else 'N',
-#         'R': 0   if memo.startswith('X') else 1,
+#         'P': sp,       # col P: Single Point Failure mode (Y/N)
+#         'R': pct_safe, # col R: Percentage of Safe Faults (0=0%, 1=100%)
 #         'S': '', 'T': '', 'U': '', 'V': '',
-#         'X': 'Y' if memo.startswith('X') else 'N',
+#         'X': sp,       # Latent Y/N mirrors single point
 #         'Y': '', 'Z': '', 'AA': '', 'AB': '', 'AD': '',
 #     }
 
@@ -873,9 +941,9 @@
 #                 _write(idx, 'G', row_num, None)
 #                 continue
 
-#             memo = str(rd.get('K', 'O')).strip()
-#             sp   = 'Y' if memo.startswith('X') else 'N'
-#             pct  = 0 if memo.startswith('X') else 1
+#             memo     = str(rd.get('K', 'O')).strip()
+#             sp       = str(rd.get('P', 'Y' if memo.startswith('X') else 'N')).strip()
+#             pct_safe = rd.get('R', 1 if memo == 'O' else 0)
 
 #             _write(idx, 'F',  row_num, None)                               # Mode FIT — formula
 #             _write(idx, 'G',  row_num, rd.get('G', ''),          wrap=True)
@@ -886,7 +954,7 @@
 #             _write(idx, 'O',  row_num, 1)
 #             _write(idx, 'P',  row_num, sp)
 #             _write(idx, 'Q',  row_num, None)                               # Failure rate — formula
-#             _write(idx, 'R',  row_num, pct)
+#             _write(idx, 'R',  row_num, pct_safe)
 #             _write(idx, 'S',  row_num, rd.get('S') or None,      wrap=True)
 #             _write(idx, 'T',  row_num, rd.get('T') or None,      wrap=True)
 #             v = rd.get('U', '')
@@ -1120,56 +1188,96 @@ def read_iec_table():
 
 def read_sm_list_from_template():
     """
-    Read SM list sheet from FMEDA_TEMPLATE.xlsx.
+    Read SM list sheet from FMEDA_TEMPLATE.xlsx (or fallback to 3_ID03_FMEDA.xlsx).
     Returns:
-      sm_list        — list of {sm_code, addressed_parts[], description}
-      block_to_sms   — dict {block_code: [SM codes that cover it]}
+      sm_coverage  : { 'SM01': 0.99, ... }
+      sm_addressed : { 'SM01': ['REF','LDO'], ... }
+      block_to_sms : { 'REF': ['SM01','SM02',...], ... }
     """
-    wb = openpyxl.load_workbook(TEMPLATE_FILE)
-
-    # Try template first (has placeholders); fall back to real FMEDA for structure
-    # The template SM list has placeholders — we need the real data from the dataset SM sheet
-    # Actually we already have it from 3_ID03 structure, so we read it from template
-    # BUT template is blank (placeholders). We need structure from real FMEDA instead.
-    # Strategy: read real FMEDA SM list if available, else build from dataset SM sheet.
-
-    sm_list = []
-
-    # Try reading from the real FMEDA (if user put it next to the script)
     import os
-    for candidate in ['3_ID03_FMEDA.xlsx']:
+    # Try sources in priority order
+    for candidate in [TEMPLATE_FILE, '3_ID03_FMEDA.xlsx']:
         if os.path.exists(candidate):
-            wb_real = openpyxl.load_workbook(candidate, data_only=True)
-            if 'SM list' in wb_real.sheetnames:
-                ws = wb_real['SM list']
-                for row in ws.iter_rows(min_row=12, max_row=ws.max_row):
-                    cells = {c.column_letter: c.value for c in row if c.value}
-                    if 'C' in cells and 'E' in cells:
-                        sm_code = str(cells['C']).strip()
-                        parts_raw = str(cells['E']).strip()
-                        parts = [p.strip() for p in re.split(r'[,;]', parts_raw) if p.strip()]
-                        sm_list.append({'sm_code': sm_code, 'addressed_parts': parts})
-                print(f"  Read SM list from {candidate}: {len(sm_list)} entries")
-                break
+            try:
+                wb_try = openpyxl.load_workbook(candidate, data_only=True)
+                if 'SM list' in wb_try.sheetnames:
+                    cov, addr, b2s = read_sm_list_from_workbook(wb_try)
+                    if cov:  # non-empty → valid
+                        print(f"  SM list read from: {candidate} ({len(cov)} entries)")
+                        return cov, addr, b2s
+            except Exception:
+                pass
 
-    # Fallback: build from dataset SM sheet + known mapping
-    if not sm_list:
-        sm_list = _build_sm_list_from_knowledge()
-        print(f"  Built SM list from internal knowledge: {len(sm_list)} entries")
+    # Fallback: hardcoded
+    print("  SM list: using built-in knowledge")
+    raw = _build_sm_list_from_knowledge()
+    cov, addr, b2s = {}, {}, {}
+    DEFAULT_COV = {
+        'SM01':0.99,'SM02':0.99,'SM03':0.99,'SM04':0.99,'SM05':0.99,
+        'SM06':0.9, 'SM08':0.9, 'SM09':0.99,'SM10':0.9, 'SM11':0.6,
+        'SM12':0.9, 'SM13':0.99,'SM14':0.99,'SM15':0.99,'SM16':0.9,
+        'SM17':0.9, 'SM18':0.99,'SM20':0.99,'SM21':0.6, 'SM22':0.99,
+        'SM23':0.9, 'SM24':0.9,
+    }
+    for entry in raw:
+        sm = entry['sm_code']
+        parts = entry['addressed_parts']
+        cov[sm]  = DEFAULT_COV.get(sm, 0.9)
+        addr[sm] = parts
+        for p in parts:
+            b2s.setdefault(p, [])
+            if sm not in b2s[p]:
+                b2s[p].append(sm)
+    return cov, addr, b2s
 
-    # Build reverse index: block_code → [SM codes]
+
+def read_sm_list_from_workbook(wb):
+    """
+    Read SM list directly from an open openpyxl workbook.
+    Returns:
+      sm_coverage  : { 'SM01': 0.99, 'SM11': 0.6, ... }  (col L)
+      sm_addressed : { 'SM01': ['REF','LDO'], ... }        (col E)
+      block_to_sms : { 'REF': ['SM01','SM02',...], ... }   reverse index
+    """
+    import re as _re
+    ws = wb['SM list']
+
+    sm_coverage  = {}   # SM code → float coverage
+    sm_addressed = {}   # SM code → list of block codes
+
+    for row in ws.iter_rows(min_row=12, max_row=ws.max_row):
+        cells = {c.column_letter: c.value for c in row if c.value is not None}
+        if 'C' not in cells:
+            continue
+        sm_code = str(cells['C']).strip()
+        if not sm_code.startswith('SM'):
+            continue
+
+        # Coverage (col L)
+        raw_cov = cells.get('L', '')
+        try:
+            cov = float(str(raw_cov))
+        except (ValueError, TypeError):
+            cov = 0.9
+        sm_coverage[sm_code] = cov
+
+        # Addressed parts (col E)
+        raw_parts = str(cells.get('E', '')).strip()
+        parts = [_re.sub(r'SW_BANK[_x\d]*', 'SW_BANK',
+                          _re.sub(r'\bCSNS\b|\bCNSN\b|\bCS\b', 'CSNS', p.strip()))
+                 for p in _re.split(r'[,;]', raw_parts) if p.strip()]
+        sm_addressed[sm_code] = parts
+
+    # Reverse index: block → [SM codes]
     block_to_sms = {}
-    for s in sm_list:
-        for part in s['addressed_parts']:
-            # Normalize: SW_BANK_x, SW_BANKx → SW_BANK
-            part_norm = re.sub(r'SW_BANK[_x\d]*', 'SW_BANK', part).strip()
-            part_norm = re.sub(r'CSNS|CNSN|CS', 'CSNS', part_norm)
-            if part_norm:
-                block_to_sms.setdefault(part_norm, [])
-                if s['sm_code'] not in block_to_sms[part_norm]:
-                    block_to_sms[part_norm].append(s['sm_code'])
+    for sm_code, parts in sm_addressed.items():
+        for part in parts:
+            if part:
+                block_to_sms.setdefault(part, [])
+                if sm_code not in block_to_sms[part]:
+                    block_to_sms[part].append(sm_code)
 
-    return sm_list, block_to_sms
+    return sm_coverage, sm_addressed, block_to_sms
 
 
 def _build_sm_list_from_knowledge():
@@ -1559,7 +1667,7 @@ SAFE MODES — these are ALWAYS "No effect" for col I:
 """.strip()
 
 
-def agent2_generate_effects(blocks, tsr_list, block_to_sms, cache):
+def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage, sm_addressed, cache):
     """Generate col I (IC effect), col J (system effect), col K (memo) for all blocks."""
 
     # Build chip context for LLM
@@ -1604,7 +1712,7 @@ def agent2_generate_effects(blocks, tsr_list, block_to_sms, cache):
             result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
             continue
 
-        rows = _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms)
+        rows = _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms, sm_coverage, sm_addressed)
         cache[ck] = rows
         save_cache(cache)
         result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
@@ -1645,7 +1753,7 @@ def _build_downstream_hint(block, chip_ctx):
     return hint
 
 
-def _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms):
+def _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms, sm_coverage, sm_addressed):
     code = block['fmeda_code']
     name = block['name']
     func = block.get('function', '')
@@ -1737,33 +1845,88 @@ Return ONLY the JSON array:"""
             rd   = parsed[i]
             ic   = str(rd.get('I', 'No effect')).strip()
             sys_ = str(rd.get('J', 'No effect')).strip()
-            # Determine memo using SM list (deterministic, not LLM)
-            memo, matching_sms = determine_memo(ic, block_to_sms)
-            rows.append(_build_row(modes[i], ic, sys_, memo))
+            memo, _ = determine_memo(ic, block_to_sms)
+            rows.append(_build_row(modes[i], ic, sys_, memo, block_to_sms, sm_coverage))
         return rows
 
     print(f"    LLM parse failed for {code} — using fallback")
-    return _fallback_rows(modes, block_to_sms)
+    return _fallback_rows(modes, block_to_sms, sm_coverage, sm_addressed)
 
 
-def _build_row(canonical_mode, ic, sys_, memo):
+def compute_sm_columns(ic_effect, block_to_sms, sm_coverage):
+    """
+    Given col I IC effect string:
+      col S / col Y : space-separated SM codes whose addressed parts match blocks in col I
+      col U         : highest coverage value among those SMs (one of 0.99, 0.9, 0.6)
+    Returns (sm_string, coverage_value)
+    """
+    if not ic_effect or ic_effect.strip() == 'No effect':
+        return '', ''
+
+    # Extract block codes from bullet list
+    affected_blocks = re.findall(r'^\s*•\s*([A-Z_a-z0-9]+)', ic_effect, re.MULTILINE)
+    # Normalize variants
+    norm = []
+    for b in affected_blocks:
+        b = b.strip().upper()
+        b = re.sub(r'SW_BANK[_X\d]*', 'SW_BANK', b)
+        b = re.sub(r'CSNS|CNSN|CS', 'CSNS', b)
+        if b not in ('NONE', 'VEGA', ''):
+            norm.append(b)
+
+    if not norm:
+        return '', ''
+
+    # Find all matching SMs
+    matching_sms = []
+    for block in norm:
+        for sm in block_to_sms.get(block, []):
+            if sm not in matching_sms:
+                matching_sms.append(sm)
+
+    if not matching_sms:
+        return '', ''
+
+    # Sort numerically for clean output: SM01 SM08 SM15 ...
+    def sm_sort_key(s):
+        m = re.search(r'(\d+)', s)
+        return int(m.group(1)) if m else 0
+    matching_sms.sort(key=sm_sort_key)
+
+    sm_string = ' '.join(matching_sms)
+
+    # col U: highest coverage among matching SMs
+    # Only valid values: 0.99, 0.9, 0.6
+    valid = [0.99, 0.9, 0.6]
+    coverages = [sm_coverage.get(sm, 0.9) for sm in matching_sms]
+    # Round to nearest valid value
+    def nearest_valid(v):
+        return min(valid, key=lambda x: abs(x - v))
+    rounded = [nearest_valid(c) for c in coverages]
+    max_cov = max(rounded) if rounded else 0.9
+
+    return sm_string, max_cov
+
+
+def _build_row(canonical_mode, ic, sys_, memo, block_to_sms=None, sm_coverage=None):
     """
     col P  (Single Point Failure mode): Y if K=X, N if K=O
-    col R  (Percentage of Safe Faults): 0 if IC effect has anything, 1 if "No effect"
-            — R is expressed as 0 or 1 here; Excel template formats as 0% / 100%
+    col R  (Percentage of Safe Faults): 0 if IC has any effect, 1 if No effect
+    col S  : SM codes whose addressed parts match blocks in col I
+    col U  : highest coverage value from those SMs (0.99 / 0.9 / 0.6)
+    col Y  : same as col S (latent SM coverage = same mechanisms)
     """
-    # Enforce consistency: No effect → always O
     ic_clean = ic.strip()
     if ic_clean in ('No effect', ''):
         memo = 'O'
 
-    # col P: Single Point — Y if memo X, N if memo O
-    sp = 'Y' if memo.startswith('X') else 'N'
-
-    # col R: Percentage of Safe Faults
-    #   0%   (value=0) if IC effect is NOT "No effect" (i.e. something is affected)
-    #   100% (value=1) if IC effect IS "No effect"
+    sp       = 'Y' if memo.startswith('X') else 'N'
     pct_safe = 1 if ic_clean == 'No effect' else 0
+
+    # Compute S, U, Y
+    sm_str, coverage = '', ''
+    if block_to_sms and sm_coverage and ic_clean != 'No effect':
+        sm_str, coverage = compute_sm_columns(ic_clean, block_to_sms, sm_coverage)
 
     return {
         'G': canonical_mode,
@@ -1771,23 +1934,28 @@ def _build_row(canonical_mode, ic, sys_, memo):
         'J': sys_,
         'K': memo,
         'O': 1,
-        'P': sp,       # col P: Single Point Failure mode (Y/N)
-        'R': pct_safe, # col R: Percentage of Safe Faults (0=0%, 1=100%)
-        'S': '', 'T': '', 'U': '', 'V': '',
-        'X': sp,       # Latent Y/N mirrors single point
-        'Y': '', 'Z': '', 'AA': '', 'AB': '', 'AD': '',
+        'P': sp,
+        'R': pct_safe,
+        'S': sm_str,    # col S: Safety mechanisms IC
+        'T': '',
+        'U': coverage,  # col U: highest coverage SPF
+        'V': '',
+        'X': sp,
+        'Y': sm_str,    # col Y: same as S (latent SM = same mechanisms)
+        'Z': '', 'AA': '', 'AB': '', 'AD': '',
     }
 
 
-def _fallback_rows(modes, block_to_sms):
+def _fallback_rows(modes, block_to_sms, sm_coverage=None, sm_addressed=None):
     SAFE = ['spike','oscillation within','start-up','jitter','duty cycle',
             'quiescent','settling','false detection']
     rows = []
     for mode in modes:
         safe = any(k in mode.lower() for k in SAFE)
-        ic = 'No effect' if safe else ''
+        ic   = 'No effect' if safe else ''
         memo, _ = determine_memo(ic, block_to_sms)
-        rows.append(_build_row(mode, ic, 'No effect' if safe else '', memo))
+        rows.append(_build_row(mode, ic, 'No effect' if safe else '', memo,
+                               block_to_sms, sm_coverage))
     return rows
 
 
@@ -1934,13 +2102,14 @@ def agent3_write_template(fmeda_data):
             _write(idx, 'P',  row_num, sp)
             _write(idx, 'Q',  row_num, None)                               # Failure rate — formula
             _write(idx, 'R',  row_num, pct_safe)
-            _write(idx, 'S',  row_num, rd.get('S') or None,      wrap=True)
-            _write(idx, 'T',  row_num, rd.get('T') or None,      wrap=True)
+            _write(idx, 'S',  row_num, rd.get('S') or None,      wrap=False)
+            _write(idx, 'T',  row_num, rd.get('T') or None,      wrap=False)
+            # col U: coverage value — write as decimal (0.99 / 0.9 / 0.6)
             v = rd.get('U', '')
-            _write(idx, 'U',  row_num, v if v not in ('', None) else None)
+            _write(idx, 'U',  row_num, v if v not in ('', None, '') else None)
             _write(idx, 'V',  row_num, None)                               # Residual FIT — formula
             _write(idx, 'X',  row_num, rd.get('X', sp))
-            _write(idx, 'Y',  row_num, rd.get('Y') or None,      wrap=True)
+            _write(idx, 'Y',  row_num, rd.get('Y') or None,      wrap=False)
             _write(idx, 'Z',  row_num, rd.get('Z') or None,      wrap=True)
             v = rd.get('AA', '')
             _write(idx, 'AA', row_num, v if v not in ('', None) else None)
@@ -1977,9 +2146,9 @@ def run():
     print("━━━ Step 0 : Reading inputs ━━━")
     blk_blocks, sm_blocks, tsr_list = read_dataset()
     iec_table = read_iec_table()
-    sm_list, block_to_sms = read_sm_list_from_template()
+    sm_coverage, sm_addressed, block_to_sms = read_sm_list_from_template()
     print(f"  BLK: {len(blk_blocks)}  SM: {len(sm_blocks)}  TSR: {len(tsr_list)}  "
-          f"IEC parts: {len(iec_table)}  SM→block mappings: {len(block_to_sms)}")
+          f"IEC parts: {len(iec_table)}  SM entries: {len(sm_coverage)}  SM→block mappings: {len(block_to_sms)}")
     print("  block_to_sms:")
     for b, sms in sorted(block_to_sms.items()):
         print(f"    {b:<15} → {sms}")
@@ -1995,7 +2164,7 @@ def run():
 
     # ── Agent 2: Generate IC effects + system effects + memo ──────────────────
     print("\n━━━ Agent 2 : IC Effects generator (LLM + deterministic memo) ━━━")
-    fmeda_data = agent2_generate_effects(blocks, tsr_list, block_to_sms, cache)
+    fmeda_data = agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage, sm_addressed, cache)
 
     # Print memo summary for verification
     print("\n  Memo check:")
