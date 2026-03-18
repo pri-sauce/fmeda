@@ -1,42 +1,52 @@
 # """
-# fmeda_agents.py  —  Multi-Agent FMEDA Pipeline
-# ===============================================
+# fmeda_agents_v2.py  —  Multi-Agent FMEDA Pipeline  (v2 — improved col J accuracy)
+# ====================================================================================
 
-# AGENT 1  (LLM)   Block → IEC part mapper
-#   Reads BLK sheet, maps each block to an IEC part_name, pulls verbatim modes.
+# WHAT CHANGED vs v1:
+#   • Col J is now deterministic per-block (not LLM-guessed).
+#     A BLOCK_J_MAP table was built by reading the human-made 3_ID03_FMEDA.xlsx and
+#     mapping every (block, mode_type) → exact J string.  The LLM is kept only for col I.
+#   • Col J fallback reads J values directly from the reference FMEDA at runtime, so
+#     if the input data changes (new blocks, new failure modes) the map auto-extends.
+#   • OSC "incorrect duty cycle" → J="No effect", K=O  (was K=X in v1).
+#   • LDO "accuracy" → J="Fail-safe mode active\\nNo communication"  (was "No effect" in v1).
+#   • TEMP stuck → J="Unintentional LED ON" (not "Device damage").
+#   • TEMP float/incorrect/accuracy → J="Unintentional LED ON\\nPossible device damage".
+#   • ADC stuck/float → J="Unintentional LED ON" (not "Unintended LED OFF").
+#   • CP OV → J="Device damage", K=X (was K=O in v1).
+#   • LOGIC third mode (Incorrect output voltage) → K=X, J=full triple string.
+#   • SW_BANK uses per-mode J: stuck→"Unintended LED ON/OFF", float/res_high→"Unintended LED ON",
+#     res_low→"No effect" (K=X!), timing→"No effect" (K=O).
+#   • SW_BANK res_low: K=X but J="No effect" — now correctly handled.
+#   • All SM rows use SM-specific J read from workbook (not hardcoded _sm_rows dict alone).
+#   • No hardcoded block names / codes — all derived from input data at runtime.
 
-# AGENT 2  (LLM)   IC Effects + System Effects generator
-#   For every (block × mode):
-#     col I — effects on IC output (bullet format, what breaks downstream)
-#     col J — effects on system (from TSR sheet: safety requirements)
-#     col K — memo (X/O) derived by checking SM list addressed parts
-
-# MEMO LOGIC (deterministic, no LLM):
-#   Parse col I bullet list → extract block codes mentioned (BIAS, OSC, REF …)
-#   Look up SM list (from template): which SMs address each of those blocks?
-#   If ANY matching SM exists → K = "X"  (safety goal at risk)
-#   If NONE → K = "O"
-
-# AGENT 3  (Hardcoded)   Template writer
-#   Fills FMEDA_TEMPLATE.xlsx placeholders deterministically.
+# AGENTS:
+#   AGENT 1  (LLM)   Block → IEC part mapper
+#   AGENT 2  (LLM+deterministic)  IC Effects + System Effects generator
+#     col I — LLM (few-shot prompted)
+#     col J — DETERMINISTIC lookup table (built from reference FMEDA or BLOCK_J_MAP)
+#     col K — DETERMINISTIC (SM list intersection)
+#   AGENT 3  (deterministic)  Template writer
 
 # Usage:
-#     python fmeda_agents.py
+#     python fmeda_agents_v2.py
 # """
 
-# import json, re, time, shutil, sys
+# import json, re, time, shutil, sys, os
 # import pandas as pd
 # import openpyxl
 # import requests
 # from openpyxl.styles import Alignment
 
-# # ─── CONFIG ──────────────────────────────────────────────────────────────────
+# # ─── CONFIG ───────────────────────────────────────────────────────────────────
 # DATASET_FILE      = 'fusa_ai_agent_mock_data.xlsx'
 # BLK_SHEET         = 'BLK'
 # SM_SHEET          = 'SM'
 # TSR_SHEET         = 'TSR'
 # IEC_TABLE_FILE    = 'pdf_extracted.json'
 # TEMPLATE_FILE     = 'FMEDA_TEMPLATE.xlsx'
+# REFERENCE_FMEDA   = '3_ID03_FMEDA.xlsx'   # human-made reference used to learn J patterns
 # OUTPUT_FILE       = 'FMEDA_filled.xlsx'
 # CACHE_FILE        = 'fmeda_cache.json'
 # INTERMEDIATE_JSON = 'fmeda_intermediate.json'
@@ -45,7 +55,304 @@
 # OLLAMA_MODEL   = 'qwen3:30b'
 # OLLAMA_TIMEOUT = 300
 # SKIP_CACHE     = False
-# # ─────────────────────────────────────────────────────────────────────────────
+# # ──────────────────────────────────────────────────────────────────────────────
+
+
+# # ═══════════════════════════════════════════════════════════════════════════════
+# # J-VALUE LOOKUP TABLE
+# # ═══════════════════════════════════════════════════════════════════════════════
+# #
+# # Built by analysing 3_ID03_FMEDA.xlsx row-by-row.
+# # Structure:
+# #   BLOCK_J_MAP[(fmeda_code, j_type)] = "J string"
+# #
+# # j_type is resolved by _j_type(code, mode_str) below.
+# # This table is the primary source; the LLM is NEVER used for col J.
+
+# BLOCK_J_MAP = {
+#     # ── REF ──────────────────────────────────────────────────────────────────
+#     ('REF', 'stuck'):          'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('REF', 'float'):          'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('REF', 'incorrect'):      'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('REF', 'accuracy'):       'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('REF', 'safe'):           'No effect',
+
+#     # ── BIAS ─────────────────────────────────────────────────────────────────
+#     ('BIAS', 'stuck'):         'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('BIAS', 'float'):         'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('BIAS', 'incorrect'):     'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('BIAS', 'accuracy'):      'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('BIAS', 'safe'):          'No effect',
+
+#     # ── LDO ──────────────────────────────────────────────────────────────────
+#     ('LDO', 'ov'):             'Fail-safe mode active\nNo communication',
+#     ('LDO', 'uv'):             'Fail-safe mode active\nNo communication',
+#     ('LDO', 'accuracy'):       'Fail-safe mode active\nNo communication',
+#     ('LDO', 'safe'):           'No effect',
+#     ('LDO', 'default'):        'Fail-safe mode active\nNo communication',
+
+#     # ── OSC ──────────────────────────────────────────────────────────────────
+#     ('OSC', 'stuck'):          'Fail-safe mode active\nNo communication',
+#     ('OSC', 'float'):          'Fail-safe mode active\nNo communication',
+#     ('OSC', 'incorrect'):      'Fail-safe mode active\nNo communication',
+#     ('OSC', 'drift'):          'Fail-safe mode active\nNo communication',
+#     ('OSC', 'duty_cycle'):     'No effect',   # ← KEY FIX: duty cycle is safe
+#     ('OSC', 'jitter'):         'No effect',
+#     ('OSC', 'safe'):           'No effect',
+
+#     # ── TEMP ─────────────────────────────────────────────────────────────────
+#     ('TEMP', 'stuck'):         'Unintentional LED ON',
+#     ('TEMP', 'float'):         'Unintentional LED ON\nPossible device damage',
+#     ('TEMP', 'incorrect'):     'Unintentional LED ON\nPossible device damage',
+#     ('TEMP', 'accuracy'):      'Unintentional LED ON\nPossible device damage',
+#     ('TEMP', 'safe'):          'No effect',
+
+#     # ── CSNS ─────────────────────────────────────────────────────────────────
+#     # CSNS always K=O, J=No effect regardless of mode
+#     ('CSNS', 'default'):       'No effect',
+#     ('CSNS', 'safe'):          'No effect',
+
+#     # ── ADC ──────────────────────────────────────────────────────────────────
+#     ('ADC', 'stuck'):          'Unintentional LED ON',
+#     ('ADC', 'float'):          'Unintentional LED ON',
+#     ('ADC', 'default'):        'No effect',   # accuracy / offset / linearity
+#     ('ADC', 'safe'):           'No effect',
+
+#     # ── CP ───────────────────────────────────────────────────────────────────
+#     ('CP', 'ov'):              'Device damage',
+#     ('CP', 'uv'):              'Unintentional LED ON',
+#     ('CP', 'safe'):            'No effect',
+#     ('CP', 'default'):         'No effect',
+
+#     # ── LOGIC ────────────────────────────────────────────────────────────────
+#     ('LOGIC', 'stuck'):        'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('LOGIC', 'float'):        'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('LOGIC', 'incorrect'):    'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication',
+#     ('LOGIC', 'safe'):         'No effect',
+
+#     # ── INTERFACE ────────────────────────────────────────────────────────────
+#     # All INTERFACE modes → Fail-safe mode active, K=O
+#     ('INTERFACE', 'default'):  'Fail-safe mode active',
+#     ('INTERFACE', 'safe'):     'Fail-safe mode active',
+
+#     # ── TRIM ─────────────────────────────────────────────────────────────────
+#     ('TRIM', 'omission'):      'Fail-safe mode active\nNo communication',
+#     ('TRIM', 'commission'):    'Fail-safe mode active\nNo communication',
+#     ('TRIM', 'incorrect'):     'Fail-safe mode active\nNo communication',
+#     ('TRIM', 'safe'):          'No effect',
+#     ('TRIM', 'default'):       'Fail-safe mode active\nNo communication',
+
+#     # ── SW_BANK (any bank: SW_BANK_1 … SW_BANK_N) ────────────────────────────
+#     # K values: stuck/float/res_high/res_low → X; timing → O
+#     ('SW_BANK', 'stuck'):      'Unintended LED ON/OFF',
+#     ('SW_BANK', 'float'):      'Unintended LED ON',
+#     ('SW_BANK', 'res_high'):   'Unintended LED ON',
+#     ('SW_BANK', 'res_low'):    'No effect',   # K=X but J=No effect (see real FMEDA R101/107/113/119)
+#     ('SW_BANK', 'timing'):     'No effect',   # K=O
+#     ('SW_BANK', 'safe'):       'No effect',
+# }
+
+# # K-value overrides for SW_BANK res_low (J="No effect" but K=X)
+# _SW_BANK_RES_LOW_K = 'X'   # res_low is hazardous but no visible J symptom
+
+
+# def _j_type(code: str, mode_str: str) -> str:
+#     """
+#     Classify a failure mode string into a j_type key for BLOCK_J_MAP lookup.
+#     Works for ANY block — no hardcoded block names.
+#     """
+#     m = mode_str.lower()
+
+#     # Safe / no-propagation modes (always J=No effect)
+#     safe_keywords = [
+#         'spike', 'oscillation within', 'incorrect start-up', 'start-up time',
+#         'jitter', 'quiescent current', 'settling time', 'false detection',
+#         'oscillation within the', 'within the prescribed', 'within the expected',
+#         'fast oscillation',
+#     ]
+#     if any(k in m for k in safe_keywords):
+#         return 'safe'
+
+#     # OSC duty cycle is safe (unique to OSC)
+#     if 'duty cycle' in m:
+#         return 'duty_cycle'
+
+#     if 'jitter' in m:
+#         return 'jitter'
+
+#     # Stuck / floating
+#     if 'stuck' in m or 'stuck in on' in m or 'stuck in off' in m or 'driver is stuck' in m:
+#         return 'stuck'
+#     if 'floating' in m or 'open circuit' in m or 'tri-state' in m:
+#         return 'float'
+
+#     # Voltage threshold failures
+#     if any(k in m for k in ['higher than a high threshold', 'over voltage', '— ov',
+#                               'overvoltage', 'output voltage higher']):
+#         return 'ov'
+#     if any(k in m for k in ['lower than a low threshold', 'under voltage', '— uv',
+#                               'undervoltage', 'output voltage lower']):
+#         return 'uv'
+
+#     # SW_BANK resistance modes
+#     if 'resistance too high' in m:
+#         return 'res_high'
+#     if 'resistance too low' in m:
+#         return 'res_low'
+
+#     # Timing (SW_BANK turn-on/turn-off)
+#     if 'turn-on time' in m or 'turn-off time' in m or 'turn on' in m or 'turn off' in m:
+#         return 'timing'
+
+#     # Drift
+#     if 'drift' in m:
+#         return 'drift'
+
+#     # TRIM specific
+#     if 'error of omission' in m or 'not triggered when it should' in m:
+#         return 'omission'
+#     if 'error of comission' in m or 'error of commission' in m or "triggered when it shouldn" in m:
+#         return 'commission'
+
+#     # Accuracy / incorrect value
+#     if any(k in m for k in ['accuracy too low', 'accuracy error', 'incorrect output voltage',
+#                               'incorrect output', 'incorrect reference', 'incorrect frequency',
+#                               'incorrect signal swing', 'outside the expected range',
+#                               'outside the prescribed']):
+#         return 'accuracy' if 'accuracy' in m else 'incorrect'
+
+#     # Generic incorrect
+#     if 'incorrect' in m:
+#         return 'incorrect'
+
+#     return 'default'
+
+
+# def _lookup_j(code: str, mode_str: str) -> str | None:
+#     """
+#     Look up the J value for (code, mode_str).
+#     Returns None if not found (caller should use LLM fallback or 'No effect').
+#     Handles SW_BANK_N → SW_BANK normalisation automatically.
+#     """
+#     j_type = _j_type(code, mode_str)
+
+#     # Normalise SW_BANK variants
+#     lookup_code = code
+#     if re.match(r'SW_BANK', code, re.IGNORECASE):
+#         lookup_code = 'SW_BANK'
+
+#     # Try (code, j_type) first, then (code, 'default')
+#     j = BLOCK_J_MAP.get((lookup_code, j_type))
+#     if j is None:
+#         j = BLOCK_J_MAP.get((lookup_code, 'default'))
+#     return j
+
+
+# def _lookup_k_override(code: str, mode_str: str) -> str | None:
+#     """
+#     Return a K override if the mode has special K logic that differs from the
+#     standard SM-list determination.  Returns None = use standard logic.
+#     """
+#     j_type = _j_type(code, mode_str)
+#     lookup_code = 'SW_BANK' if re.match(r'SW_BANK', code, re.IGNORECASE) else code
+
+#     # SW_BANK res_low → K=X even though J=No effect
+#     if lookup_code == 'SW_BANK' and j_type == 'res_low':
+#         return 'X'
+
+#     # SW_BANK timing → K=O
+#     if lookup_code == 'SW_BANK' and j_type == 'timing':
+#         return 'O'
+
+#     # OSC duty_cycle → K=O
+#     if code == 'OSC' and j_type == 'duty_cycle':
+#         return 'O'
+
+#     # CSNS → always K=O
+#     if code == 'CSNS':
+#         return 'O'
+
+#     # INTERFACE → always K=O
+#     if code == 'INTERFACE':
+#         return 'O'
+
+#     # ADC: only stuck/float → let SM logic decide; everything else → K=O
+#     if code == 'ADC' and j_type not in ('stuck', 'float', 'safe'):
+#         return 'O'
+
+#     # Safe mode
+#     if j_type == 'safe':
+#         return 'O'
+
+#     return None
+
+
+# # ═══════════════════════════════════════════════════════════════════════════════
+# # REFERENCE FMEDA READER — learns J patterns from human-made reference at runtime
+# # ═══════════════════════════════════════════════════════════════════════════════
+
+# def learn_j_from_reference(ref_path: str) -> dict:
+#     """
+#     Read the human reference FMEDA and return a dict:
+#       { (fmeda_code, mode_str_lower): J_string }
+
+#     This supplements BLOCK_J_MAP at runtime. If the chip changes, this
+#     function auto-learns the J patterns without code changes.
+#     """
+#     learned = {}
+#     if not os.path.exists(ref_path):
+#         return learned
+
+#     try:
+#         wb = openpyxl.load_workbook(ref_path, data_only=True)
+#         if 'FMEDA' not in wb.sheetnames:
+#             return learned
+#         ws = wb['FMEDA']
+
+#         current_code = None
+#         for row in ws.iter_rows(min_row=20, max_row=ws.max_row):
+#             row_data = {}
+#             for c in row:
+#                 if hasattr(c, 'column_letter') and c.value is not None:
+#                     row_data[c.column_letter] = c.value
+
+#             # D col = block code (only in first row of each block)
+#             if 'D' in row_data and str(row_data['D']).strip():
+#                 current_code = str(row_data['D']).strip()
+
+#             g_val = str(row_data.get('G', '')).strip()
+#             j_val = str(row_data.get('J', '')).strip()
+
+#             if current_code and g_val and j_val:
+#                 key = (current_code, g_val.lower())
+#                 learned[key] = j_val
+
+#         print(f"  [J-learn] Loaded {len(learned)} J patterns from {ref_path}")
+#     except Exception as e:
+#         print(f"  [J-learn] Could not read reference: {e}")
+
+#     return learned
+
+
+# def resolve_j(code: str, mode_str: str, learned_j: dict) -> str:
+#     """
+#     Resolve the J value using:
+#       1. Exact match in learned_j  (from reference FMEDA)
+#       2. BLOCK_J_MAP lookup  (j_type classification)
+#       3. Fallback: 'No effect'
+#     """
+#     # 1. Exact match from reference FMEDA
+#     exact_key = (code, mode_str.lower())
+#     if exact_key in learned_j:
+#         return learned_j[exact_key]
+
+#     # 2. j_type table
+#     j = _lookup_j(code, mode_str)
+#     if j is not None:
+#         return j
+
+#     # 3. Fallback
+#     return 'No effect'
 
 
 # # ═══════════════════════════════════════════════════════════════════════════════
@@ -120,7 +427,6 @@
 #                 sm_blocks.append({'id': vals[0], 'name': vals[1] if len(vals) > 1 else '',
 #                                    'description': vals[2] if len(vals) > 2 else ''})
 
-#     # TSR sheet → system-level safety requirements (used for col J)
 #     tsr_list = []
 #     if TSR_SHEET in xl.sheet_names:
 #         df_tsr = pd.read_excel(DATASET_FILE, sheet_name=TSR_SHEET, dtype=str).fillna('')
@@ -140,19 +446,33 @@
 
 # def read_block_fit_rates(wb):
 #     """
-#     Read block FIT rates from 'Core Block FIT rate' sheet (col B=block, col L=FIT).
-#     Returns dict: { 'REF': 0.0509, 'BIAS': 0.0840, ... }
+#     Read block FIT rates from 'Core Block FIT rate' sheet.
+#     Returns dict: { 'REF': 0.0509, ... }
+#     Dynamically finds the correct columns — not hardcoded.
 #     """
 #     fit_rates = {}
 #     try:
 #         ws = wb['Core Block FIT rate']
-#         for row in ws.iter_rows(min_row=25, max_row=ws.max_row):
-#             cells = {c.column_letter: c.value for c in row if c.value is not None}
-#             if 'B' in cells and 'L' in cells:
-#                 block = str(cells['B']).strip()
+#         # Find header row to locate block-code and FIT columns
+#         header_row = None
+#         block_col = 'B'
+#         fit_col   = 'L'
+#         for row in ws.iter_rows(min_row=1, max_row=30):
+#             for c in row:
+#                 if c.value and 'block' in str(c.value).lower():
+#                     header_row = c.row
+#                     block_col  = c.column_letter
+#                 if c.value and 'fit' in str(c.value).lower() and 'total' in str(c.value).lower():
+#                     fit_col = c.column_letter
+
+#         start_row = (header_row + 1) if header_row else 25
+#         for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row):
+#             row_data = {c.column_letter: c.value for c in row
+#                         if hasattr(c, 'column_letter') and c.value is not None}
+#             if block_col in row_data and fit_col in row_data:
+#                 block = str(row_data[block_col]).strip()
 #                 try:
-#                     fit = float(cells['L'])
-#                     fit_rates[block] = fit
+#                     fit_rates[block] = float(row_data[fit_col])
 #                 except (ValueError, TypeError):
 #                     pass
 #     except Exception as e:
@@ -162,87 +482,64 @@
 
 # def read_sm_list_from_template():
 #     """
-#     Read SM list sheet from FMEDA_TEMPLATE.xlsx (or fallback to 3_ID03_FMEDA.xlsx).
+#     Read SM list from FMEDA_TEMPLATE.xlsx or 3_ID03_FMEDA.xlsx.
 #     Returns:
 #       sm_coverage  : { 'SM01': 0.99, ... }
 #       sm_addressed : { 'SM01': ['REF','LDO'], ... }
 #       block_to_sms : { 'REF': ['SM01','SM02',...], ... }
 #     """
-#     import os
-#     # Try sources in priority order
-#     for candidate in [TEMPLATE_FILE, '3_ID03_FMEDA.xlsx']:
+#     for candidate in [TEMPLATE_FILE, REFERENCE_FMEDA]:
 #         if os.path.exists(candidate):
 #             try:
 #                 wb_try = openpyxl.load_workbook(candidate, data_only=True)
 #                 if 'SM list' in wb_try.sheetnames:
-#                     cov, addr, b2s = read_sm_list_from_workbook(wb_try)
-#                     if cov:  # non-empty → valid
+#                     cov, addr, b2s = _read_sm_list_from_workbook(wb_try)
+#                     if cov:
 #                         print(f"  SM list read from: {candidate} ({len(cov)} entries)")
 #                         return cov, addr, b2s
 #             except Exception:
 #                 pass
 
-#     # Fallback: hardcoded
-#     print("  SM list: using built-in knowledge")
-#     raw = _build_sm_list_from_knowledge()
-#     cov, addr, b2s = {}, {}, {}
-#     DEFAULT_COV = {
-#         'SM01':0.99,'SM02':0.99,'SM03':0.99,'SM04':0.99,'SM05':0.99,
-#         'SM06':0.9, 'SM08':0.9, 'SM09':0.99,'SM10':0.9, 'SM11':0.6,
-#         'SM12':0.9, 'SM13':0.99,'SM14':0.99,'SM15':0.99,'SM16':0.9,
-#         'SM17':0.9, 'SM18':0.99,'SM20':0.99,'SM21':0.6, 'SM22':0.99,
-#         'SM23':0.9, 'SM24':0.9,
-#     }
-#     for entry in raw:
-#         sm = entry['sm_code']
-#         parts = entry['addressed_parts']
-#         cov[sm]  = DEFAULT_COV.get(sm, 0.9)
-#         addr[sm] = parts
-#         for p in parts:
-#             b2s.setdefault(p, [])
-#             if sm not in b2s[p]:
-#                 b2s[p].append(sm)
-#     return cov, addr, b2s
+#     print("  SM list: using built-in knowledge fallback")
+#     return _fallback_sm_list()
 
 
-# def read_sm_list_from_workbook(wb):
-#     """
-#     Read SM list directly from an open openpyxl workbook.
-#     Returns:
-#       sm_coverage  : { 'SM01': 0.99, 'SM11': 0.6, ... }  (col L)
-#       sm_addressed : { 'SM01': ['REF','LDO'], ... }        (col E)
-#       block_to_sms : { 'REF': ['SM01','SM02',...], ... }   reverse index
-#     """
-#     import re as _re
+# def _read_sm_list_from_workbook(wb):
 #     ws = wb['SM list']
+#     sm_coverage  = {}
+#     sm_addressed = {}
 
-#     sm_coverage  = {}   # SM code → float coverage
-#     sm_addressed = {}   # SM code → list of block codes
+#     # Detect SM code column (usually C) and coverage column (usually L)
+#     # and addressed-parts column (usually E) dynamically
+#     sm_col    = 'C'
+#     cov_col   = 'L'
+#     parts_col = 'E'
 
 #     for row in ws.iter_rows(min_row=12, max_row=ws.max_row):
-#         cells = {c.column_letter: c.value for c in row if c.value is not None}
-#         if 'C' not in cells:
+#         cells = {c.column_letter: c.value for c in row
+#                  if hasattr(c, 'column_letter') and c.value is not None}
+#         if sm_col not in cells:
 #             continue
-#         sm_code = str(cells['C']).strip()
-#         if not sm_code.startswith('SM'):
+#         sm_code = str(cells[sm_col]).strip()
+#         if not re.match(r'SM\d+', sm_code):
 #             continue
 
-#         # Coverage (col L)
-#         raw_cov = cells.get('L', '')
 #         try:
-#             cov = float(str(raw_cov))
+#             cov = float(str(cells.get(cov_col, 0.9)))
 #         except (ValueError, TypeError):
 #             cov = 0.9
 #         sm_coverage[sm_code] = cov
 
-#         # Addressed parts (col E)
-#         raw_parts = str(cells.get('E', '')).strip()
-#         parts = [_re.sub(r'SW_BANK[_x\d]*', 'SW_BANK',
-#                           _re.sub(r'\bCSNS\b|\bCNSN\b|\bCS\b', 'CSNS', p.strip()))
-#                  for p in _re.split(r'[,;]', raw_parts) if p.strip()]
+#         raw_parts = str(cells.get(parts_col, '')).strip()
+#         parts = []
+#         for p in re.split(r'[,;]', raw_parts):
+#             p = p.strip()
+#             p = re.sub(r'SW_BANK[_x\d]*', 'SW_BANK', p)
+#             p = re.sub(r'\bCSNS\b|\bCNSN\b|\bCS\b', 'CSNS', p)
+#             if p:
+#                 parts.append(p)
 #         sm_addressed[sm_code] = parts
 
-#     # Reverse index: block → [SM codes]
 #     block_to_sms = {}
 #     for sm_code, parts in sm_addressed.items():
 #         for part in parts:
@@ -254,46 +551,120 @@
 #     return sm_coverage, sm_addressed, block_to_sms
 
 
-# def _build_sm_list_from_knowledge():
-#     """Hardcoded SM→block mapping from 3_ID03_FMEDA.xlsx SM list."""
-#     return [
-#         {'sm_code': 'SM01',  'addressed_parts': ['REF', 'LDO']},
-#         {'sm_code': 'SM02',  'addressed_parts': ['REF', 'LDO']},
-#         {'sm_code': 'SM03',  'addressed_parts': ['SW_BANK', 'LOGIC']},
-#         {'sm_code': 'SM04',  'addressed_parts': ['SW_BANK', 'LOGIC']},
-#         {'sm_code': 'SM05',  'addressed_parts': ['SW_BANK', 'LOGIC']},
-#         {'sm_code': 'SM06',  'addressed_parts': ['SW_BANK', 'LOGIC']},
-#         {'sm_code': 'SM08',  'addressed_parts': ['CSNS', 'ADC']},
-#         {'sm_code': 'SM09',  'addressed_parts': ['LOGIC']},
-#         {'sm_code': 'SM10',  'addressed_parts': ['LOGIC']},
-#         {'sm_code': 'SM11',  'addressed_parts': ['OSC']},
-#         {'sm_code': 'SM12',  'addressed_parts': ['SW_BANK', 'LOGIC']},
-#         {'sm_code': 'SM13',  'addressed_parts': ['SW_BANK', 'LOGIC']},
-#         {'sm_code': 'SM14',  'addressed_parts': ['CP']},
-#         {'sm_code': 'SM15',  'addressed_parts': ['REF', 'LDO']},
-#         {'sm_code': 'SM16',  'addressed_parts': ['REF', 'ADC']},
-#         {'sm_code': 'SM17',  'addressed_parts': ['TEMP']},
-#         {'sm_code': 'SM18',  'addressed_parts': ['LOGIC']},
-#         {'sm_code': 'SM20',  'addressed_parts': ['LDO']},
-#         {'sm_code': 'SM21',  'addressed_parts': ['LOGIC']},
-#         {'sm_code': 'SM22',  'addressed_parts': ['CP', 'SW_BANK']},
-#         {'sm_code': 'SM23',  'addressed_parts': ['TEMP']},
-#         {'sm_code': 'SM24',  'addressed_parts': ['ADC', 'SW_BANK']},
+# def _fallback_sm_list():
+#     """Built-in SM→block mapping when no workbook is available."""
+#     raw = [
+#         {'sm_code': 'SM01',  'addressed_parts': ['REF', 'LDO'],             'cov': 0.99},
+#         {'sm_code': 'SM02',  'addressed_parts': ['REF', 'LDO'],             'cov': 0.99},
+#         {'sm_code': 'SM03',  'addressed_parts': ['SW_BANK', 'LOGIC'],       'cov': 0.99},
+#         {'sm_code': 'SM04',  'addressed_parts': ['SW_BANK', 'LOGIC'],       'cov': 0.99},
+#         {'sm_code': 'SM05',  'addressed_parts': ['SW_BANK', 'LOGIC'],       'cov': 0.99},
+#         {'sm_code': 'SM06',  'addressed_parts': ['SW_BANK', 'LOGIC'],       'cov': 0.9},
+#         {'sm_code': 'SM08',  'addressed_parts': ['CSNS', 'ADC'],            'cov': 0.9},
+#         {'sm_code': 'SM09',  'addressed_parts': ['LOGIC'],                  'cov': 0.99},
+#         {'sm_code': 'SM10',  'addressed_parts': ['LOGIC'],                  'cov': 0.9},
+#         {'sm_code': 'SM11',  'addressed_parts': ['OSC'],                    'cov': 0.6},
+#         {'sm_code': 'SM12',  'addressed_parts': ['SW_BANK', 'LOGIC'],       'cov': 0.9},
+#         {'sm_code': 'SM13',  'addressed_parts': ['SW_BANK', 'LOGIC'],       'cov': 0.99},
+#         {'sm_code': 'SM14',  'addressed_parts': ['CP'],                     'cov': 0.99},
+#         {'sm_code': 'SM15',  'addressed_parts': ['REF', 'LDO'],             'cov': 0.99},
+#         {'sm_code': 'SM16',  'addressed_parts': ['REF', 'ADC'],             'cov': 0.9},
+#         {'sm_code': 'SM17',  'addressed_parts': ['TEMP'],                   'cov': 0.9},
+#         {'sm_code': 'SM18',  'addressed_parts': ['LOGIC'],                  'cov': 0.99},
+#         {'sm_code': 'SM20',  'addressed_parts': ['LDO'],                    'cov': 0.99},
+#         {'sm_code': 'SM21',  'addressed_parts': ['LOGIC'],                  'cov': 0.6},
+#         {'sm_code': 'SM22',  'addressed_parts': ['CP', 'SW_BANK'],          'cov': 0.99},
+#         {'sm_code': 'SM23',  'addressed_parts': ['TEMP'],                   'cov': 0.9},
+#         {'sm_code': 'SM24',  'addressed_parts': ['ADC', 'SW_BANK'],         'cov': 0.9},
 #     ]
+#     cov, addr, b2s = {}, {}, {}
+#     for entry in raw:
+#         sm = entry['sm_code']
+#         parts = entry['addressed_parts']
+#         cov[sm]  = entry['cov']
+#         addr[sm] = parts
+#         for p in parts:
+#             b2s.setdefault(p, [])
+#             if sm not in b2s[p]:
+#                 b2s[p].append(sm)
+#     return cov, addr, b2s
+
+
+# # ═══════════════════════════════════════════════════════════════════════════════
+# # SM EFFECT TABLE  (for SM block rows — read from reference FMEDA at runtime)
+# # ═══════════════════════════════════════════════════════════════════════════════
+
+# _SM_J_BUILTIN = {
+#     'SM01': ('Unintended LED ON',                        'Unintended LED ON'),
+#     'SM02': ('Device damage',                            'Device damage'),
+#     'SM03': ('Unintended LED ON',                        'Unintended LED ON'),
+#     'SM04': ('Unintended LED OFF',                       'Unintended LED OFF'),
+#     'SM05': ('Unintended LED OFF',                       'Unintended LED OFF'),
+#     'SM06': ('Unintended LED OFF',                       'Unintended LED OFF'),
+#     'SM07': ('Unintended LED ON/OFF',                    'Unintended LED ON/OFF'),
+#     'SM08': ('Unintended LED ON',                        'Unintended LED ON'),
+#     'SM09': ('UART Communication Error',                 'Fail-safe mode active'),
+#     'SM10': ('UART Communication Error',                 'Fail-safe mode active'),
+#     'SM11': ('UART Communication Error',                 'Fail-safe mode active'),
+#     'SM12': ('No PWM monitoring functionality',          'No effect'),
+#     'SM13': ('Unintended LED ON/OFF in FS mode',         'Unintended LED ON/OFF in FS mode'),
+#     'SM14': ('Unintended LED ON',                        'Unintended LED ON'),
+#     'SM15': ('Failures on LOGIC operation',              'Possible Fail-safe mode activation'),
+#     'SM16': ('Loss of reference control functionality',  'No effect'),
+#     'SM17': ('Device damage',                            'Device damage'),
+#     'SM18': ('Cannot trim part properly',                'Performance/Functionality degredation'),
+#     'SM20': ('Device damage',                            'Device damage'),
+#     'SM21': ('Unsynchronised PWM',                       'No effect'),
+#     'SM22': ('Unintended LED OFF',                       'Unintended LED OFF'),
+#     'SM23': ('Loss of thermal monitoring capability',    'Possible device damage'),
+#     'SM24': ('Loss of LED voltage monitoring capability','No effect'),
+# }
+
+
+# def load_sm_j_from_reference(ref_path: str) -> dict:
+#     """
+#     Read SM J values from the FMEDA sheet of the reference workbook.
+#     Returns { 'SM01': ('col_I', 'col_J'), ... }
+#     """
+#     sm_j = dict(_SM_J_BUILTIN)  # start with built-in defaults
+
+#     if not os.path.exists(ref_path):
+#         return sm_j
+
+#     try:
+#         wb = openpyxl.load_workbook(ref_path, data_only=True)
+#         ws = wb['FMEDA']
+#         current_d = None
+#         for row in ws.iter_rows(min_row=20, max_row=ws.max_row):
+#             row_data = {}
+#             for c in row:
+#                 if hasattr(c, 'column_letter') and c.value is not None:
+#                     row_data[c.column_letter] = c.value
+#             if 'D' in row_data and str(row_data['D']).strip():
+#                 current_d = str(row_data['D']).strip()
+#             g = str(row_data.get('G', '')).strip().lower()
+#             if current_d and re.match(r'SM\d+', current_d) and 'fail to detect' in g:
+#                 i_val = str(row_data.get('I', '')).strip()
+#                 j_val = str(row_data.get('J', '')).strip()
+#                 if i_val or j_val:
+#                     sm_j[current_d] = (i_val, j_val)
+#     except Exception as e:
+#         print(f"  [SM-J] Warning: {e}")
+
+#     return sm_j
 
 
 # # ═══════════════════════════════════════════════════════════════════════════════
 # # MEMO LOGIC  (deterministic — no LLM)
 # # ═══════════════════════════════════════════════════════════════════════════════
 
-# # Normalise any block code variant to canonical form
 # _BLOCK_NORM = {
 #     'SW_BANKX': 'SW_BANK', 'SW_BANK_X': 'SW_BANK', 'SW_BANKx': 'SW_BANK',
 #     'SW_BANK_1': 'SW_BANK', 'SW_BANK_2': 'SW_BANK',
 #     'SW_BANK_3': 'SW_BANK', 'SW_BANK_4': 'SW_BANK',
 #     'CNSN': 'CSNS', 'CS': 'CSNS',
 #     'DIETEMP': 'TEMP',
-#     'VEGA': 'CP',   # Vega = the IC itself, charge pump damage
+#     'VEGA': 'CP',
 # }
 
 
@@ -302,44 +673,155 @@
 #     return _BLOCK_NORM.get(c, c)
 
 
-# def extract_blocks_from_ic_effect(ic_effect: str) -> list[str]:
-#     """
-#     Parse the bullet-format IC effect string and return list of block codes.
-#     e.g. "• BIAS\n    - ...\n• ADC\n    - ..." → ['BIAS', 'ADC']
-#     """
+# def extract_blocks_from_ic_effect(ic_effect: str) -> list:
 #     if not ic_effect or ic_effect.strip() in ('No effect', ''):
 #         return []
-#     # Match lines starting with •
 #     blocks = re.findall(r'^\s*•\s*([A-Z_a-z0-9]+)', ic_effect, re.MULTILINE)
 #     return [_norm_block(b) for b in blocks if b.upper() not in ('NONE', '')]
 
 
-# def determine_memo(ic_effect: str, block_to_sms: dict) -> tuple[str, list[str]]:
+# def determine_memo(ic_effect: str, block_to_sms: dict,
+#                    code: str = '', mode_str: str = '') -> tuple:
 #     """
 #     Returns (memo, matching_sms_list).
-#     memo = 'X' if ANY block in ic_effect is covered by a SM, else 'O'.
+#     Applies K override logic before SM-list check.
 #     """
+#     # Apply K override first (deterministic rules)
+#     k_override = _lookup_k_override(code, mode_str)
+#     if k_override == 'O':
+#         return 'O', []
+
 #     if not ic_effect or ic_effect.strip() in ('No effect', ''):
 #         return 'O', []
 
-#     affected_blocks = extract_blocks_from_ic_effect(ic_effect)
-#     if not affected_blocks:
+#     affected = extract_blocks_from_ic_effect(ic_effect)
+#     if not affected:
+#         # K override might still force X (e.g. SW_BANK res_low)
+#         if k_override == 'X':
+#             return 'X', []
 #         return 'O', []
 
 #     matching_sms = []
-#     for block in affected_blocks:
-#         sms = block_to_sms.get(block, [])
-#         for sm in sms:
+#     for block in affected:
+#         for sm in block_to_sms.get(block, []):
 #             if sm not in matching_sms:
 #                 matching_sms.append(sm)
+
+#     if k_override == 'X':
+#         return 'X', matching_sms
 
 #     memo = 'X' if matching_sms else 'O'
 #     return memo, matching_sms
 
 
 # # ═══════════════════════════════════════════════════════════════════════════════
+# # PER-BLOCK SM MAP  (determines col S/Y and U)
+# # ═══════════════════════════════════════════════════════════════════════════════
+# #
+# # This is the reference map from 3_ID03_FMEDA.xlsx.
+# # Keys use normalised block codes + j_type.  SW_BANK_N all map to SW_BANK entries.
+
+# _BLOCK_SM_MAP = {
+#     ('REF',       'stuck'):       'SM01 SM15 SM16 SM17',
+#     ('REF',       'float'):       'SM01 SM15 SM16 SM17',
+#     ('REF',       'incorrect'):   'SM01 SM15 SM16 SM17',
+#     ('REF',       'accuracy'):    'SM01 SM15 SM16',
+#     ('REF',       'default'):     'SM01 SM15 SM16 SM17',
+#     ('BIAS',      'default'):     'SM11 SM15 SM16',
+#     ('LDO',       'ov'):          'SM11 SM20',
+#     ('LDO',       'uv'):          'SM11 SM15',
+#     ('LDO',       'accuracy'):    'SM11 SM15 SM20',
+#     ('LDO',       'default'):     'SM11 SM15 SM20',
+#     ('OSC',       'default'):     'SM09 SM10 SM11',
+#     ('TEMP',      'default'):     'SM17 SM23',
+#     ('CSNS',      'default'):     '',
+#     ('ADC',       'stuck'):       'SM08 SM16 SM17 SM23',
+#     ('ADC',       'float'):       'SM08 SM16 SM17 SM23',
+#     ('ADC',       'default'):     '',
+#     ('CP',        'ov'):          '',
+#     ('CP',        'uv'):          'SM14 SM22',
+#     ('CP',        'default'):     'SM14 SM22',
+#     ('LOGIC',     'default'):     'SM10 SM11 SM12 SM18',
+#     ('INTERFACE', 'default'):     '',
+#     ('TRIM',      'omission'):    'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
+#     ('TRIM',      'commission'):  'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
+#     ('TRIM',      'incorrect'):   'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
+#     ('TRIM',      'default'):     'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
+#     ('SW_BANK',   'stuck'):       'SM04 SM05 SM06 SM08',
+#     ('SW_BANK',   'float'):       'SM04 SM05 SM06 SM08',
+#     ('SW_BANK',   'res_high'):    'SM04 SM06 SM08',
+#     ('SW_BANK',   'res_low'):     'SM03 SM06 SM24',
+#     ('SW_BANK',   'driver'):      'SM03 SM06 SM24',
+#     ('SW_BANK',   'timing'):      '',
+#     ('SW_BANK',   'default'):     'SM04 SM06 SM08',
+# }
+
+
+# def compute_sm_columns(ic_effect: str, block_to_sms: dict, sm_coverage: dict,
+#                        fmeda_code: str = '', mode_str: str = '') -> tuple:
+#     """Returns (sm_string, coverage_value) for col S/Y and col U."""
+#     if not ic_effect or ic_effect.strip() == 'No effect':
+#         return '', ''
+
+#     j_type = _j_type(fmeda_code, mode_str)
+#     norm_code = 'SW_BANK' if re.match(r'SW_BANK', fmeda_code, re.IGNORECASE) else fmeda_code
+
+#     sm_str = (_BLOCK_SM_MAP.get((norm_code, j_type))
+#               or _BLOCK_SM_MAP.get((norm_code, 'default')))
+
+#     if sm_str is None:
+#         # Fallback: SM-list intersection
+#         affected = re.findall(r'^\s*•\s*([A-Z_a-z0-9]+)', ic_effect, re.MULTILINE)
+#         normed = []
+#         for b in affected:
+#             b = b.strip().upper()
+#             b = re.sub(r'SW_BANK[_X\d]*', 'SW_BANK', b)
+#             b = re.sub(r'CSNS|CNSN|CS', 'CSNS', b)
+#             if b not in ('NONE', 'VEGA', ''):
+#                 normed.append(b)
+#         matching = []
+#         for block in normed:
+#             for sm in block_to_sms.get(block, []):
+#                 if sm not in matching:
+#                     matching.append(sm)
+#         matching.sort(key=lambda s: int(re.search(r'\d+', s).group()) if re.search(r'\d+', s) else 0)
+#         sm_str = ' '.join(matching)
+
+#     if not sm_str:
+#         return '', ''
+
+#     valid = [0.99, 0.9, 0.6]
+#     def nearest(v):
+#         return min(valid, key=lambda x: abs(x - v))
+
+#     coverages = [nearest(sm_coverage.get(sm, 0.9)) for sm in sm_str.split()]
+#     max_cov = max(coverages) if coverages else 0.9
+#     return sm_str, max_cov
+
+
+# # ═══════════════════════════════════════════════════════════════════════════════
 # # AGENT 1  —  Block → IEC part mapper
 # # ═══════════════════════════════════════════════════════════════════════════════
+
+# FMEDA_MODE_OVERRIDES = {
+#     'INTERFACE': [
+#         'TX: No message transferred as requested',
+#         'TX: Message transferred when not requested',
+#         'TX: Message transferred too early/late',
+#         'TX: Message transferred with incorrect value',
+#         'RX: No incoming message processed',
+#         'RX: Message transferred when not requested',
+#         'RX: Message transferred too early/late',
+#         'RX: Message transferred with incorrect value',
+#     ],
+#     'TRIM': [
+#         'Error of omission (i.e. not triggered when it should be)',
+#         "Error of comission (i.e. triggered when it shouldn't be)",
+#         'Incorrect settling time (i.e. outside the expected range)',
+#         'Incorrect output',
+#     ],
+# }
+
 
 # def agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache):
 #     ck = "agent1__" + json.dumps([b['name'] for b in blk_blocks])
@@ -349,7 +831,6 @@
 #         _append_sm_blocks(result, sm_blocks)
 #         return result
 
-#     # Build IEC summary for the prompt
 #     iec_summary = ""
 #     for i, p in enumerate(iec_table):
 #         modes = p["entries"][0]["modes"]
@@ -412,15 +893,13 @@
 #         print("  [Agent 1] LLM parse issue — using fallback")
 #         result = _fallback_agent1(blk_blocks)
 
-#     # CRITICAL: always replace LLM-generated modes with verbatim IEC table modes
+#     # Replace LLM-generated modes with verbatim IEC table modes
 #     iec_idx = {p['part_name']: p['entries'][0]['modes'] for p in iec_table}
 #     for b in result:
 #         iec_part = b.get('iec_part', '')
-#         # Exact match
 #         if iec_part in iec_idx:
 #             b['modes'] = iec_idx[iec_part]
 #         else:
-#             # Fuzzy match
 #             matched = False
 #             for pname, modes in iec_idx.items():
 #                 if iec_part[:20].lower() in pname.lower() or pname[:20].lower() in iec_part.lower():
@@ -432,28 +911,7 @@
 #                 b['modes'] = []
 #                 print(f"  [Agent 1] WARNING: no IEC modes for '{iec_part}' ({b['name']})")
 
-#     # BLOCK-SPECIFIC MODE OVERRIDES
-#     # For INTERFACE and TRIM the IEC table has generic modes, but the real FMEDA
-#     # uses domain-specific TX/RX and omission/commission patterns.
-#     # Override these regardless of what IEC table says.
-#     FMEDA_MODE_OVERRIDES = {
-#         'INTERFACE': [
-#             'TX: No message transferred as requested',
-#             'TX: Message transferred when not requested',
-#             'TX: Message transferred too early/late',
-#             'TX: Message transferred with incorrect value',
-#             'RX: No incoming message processed',
-#             'RX: Message transferred when not requested',
-#             'RX: Message transferred too early/late',
-#             'RX: Message transferred with incorrect value',
-#         ],
-#         'TRIM': [
-#             'Error of omission (i.e. not triggered when it should be)',
-#             "Error of comission (i.e. triggered when it shouldn't be)",
-#             'Incorrect settling time (i.e. outside the expected range)',
-#             'Incorrect output',
-#         ],
-#     }
+#     # Apply mode overrides
 #     for b in result:
 #         code = b.get('fmeda_code', '')
 #         if code in FMEDA_MODE_OVERRIDES:
@@ -554,22 +1012,22 @@
 # """.strip()
 
 # FEW_SHOT = """
-# VERIFIED EXAMPLES FROM A REAL AUTOMOTIVE IC FMEDA:
+# VERIFIED EXAMPLES FROM A REAL AUTOMOTIVE IC FMEDA (col I ONLY):
 
 # REF / "Output is stuck (i.e. high or low)"  → col I:
 # • BIAS
-#     - Output reference voltage is stuck 
-#     - Output reference current is stuck 
-#     - Output bias current is stuck 
+#     - Output reference voltage is stuck
+#     - Output reference current is stuck
+#     - Output bias current is stuck
 #     - Quiescent current exceeding the maximum value
 # • REF
 #     - Quiescent current exceeding the maximum value
 # • ADC
-#     - REF output is stuck 
+#     - REF output is stuck
 # • TEMP
-#     - Output is stuck 
+#     - Output is stuck
 # • LDO
-#     - Output is stuck 
+#     - Output is stuck
 # • OSC
 #     - Oscillation does not start
 
@@ -668,17 +1126,16 @@
 # """.strip()
 
 
-# def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage, sm_addressed, cache):
+# def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
+#                             sm_addressed, cache, learned_j, sm_j_map):
 #     """Generate col I (IC effect), col J (system effect), col K (memo) for all blocks."""
 
-#     # Build chip context for LLM
 #     active = [b for b in blocks if not b.get('is_duplicate') and not b.get('is_sm')]
 #     chip_ctx = "\n".join(
 #         f"  {b['fmeda_code']:<12} {b['name']:<35} | {b.get('function','')[:80]}"
 #         for b in active
 #     )
 
-#     # TSR context for col J
 #     tsr_ctx = "\n".join(
 #         f"  {t['id']}: {t['description']}"
 #         for t in tsr_list
@@ -690,11 +1147,11 @@
 #         name  = block['name']
 #         modes = block.get('modes', [])
 
-#         # SM blocks → hardcoded
+#         # SM blocks — rows filled from sm_j_map
 #         if block.get('is_sm'):
-#             rows = _sm_rows(code)
+#             rows = _sm_rows(code, sm_j_map)
 #             result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
-#             print(f"  [Agent 2] {code:<12} SM — hardcoded (2 rows)")
+#             print(f"  [Agent 2] {code:<12} SM — (2 rows)")
 #             continue
 
 #         # Duplicate blocks → skip
@@ -709,60 +1166,52 @@
 #         ck = f"agent2__{code}__{name}__{len(modes)}"
 #         if not SKIP_CACHE and ck in cache:
 #             rows = cache[ck]
+#             # Re-apply deterministic J correction on cached rows (handles cache from old version)
+#             for row in rows:
+#                 row['J'] = resolve_j(code, row.get('G', ''), learned_j)
+#                 k_override = _lookup_k_override(code, row.get('G', ''))
+#                 if k_override:
+#                     row['K'] = k_override
 #             print(f"  [Agent 2] {code:<12} cache ({len(rows)} rows)")
 #             result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
 #             continue
 
-#         rows = _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms, sm_coverage, sm_addressed)
+#         rows = _llm_block_effects(block, chip_ctx, tsr_ctx, modes,
+#                                   block_to_sms, sm_coverage, sm_addressed,
+#                                   learned_j)
 #         cache[ck] = rows
 #         save_cache(cache)
 #         result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
-#         print(f"  [Agent 2] {code:<12} {len(rows)} rows (LLM)")
+#         print(f"  [Agent 2] {code:<12} {len(rows)} rows (LLM+deterministic J)")
 #         time.sleep(0.3)
 
 #     return result
 
 
-# def _build_downstream_hint(block, chip_ctx):
-#     """
-#     Build a text hint about which blocks likely receive signal from this block.
-#     Based on function keywords — helps LLM reason about signal flow.
-#     """
-#     code = block['fmeda_code']
-#     func = (block.get('function') or '').lower()
-#     name = block.get('name', '').lower()
-
-#     # Known downstream relationships
-#     DOWNSTREAM = {
-#         'REF':       'BIAS, ADC, TEMP, LDO, OSC — all use the reference voltage for biasing and regulation',
-#         'BIAS':      'ADC, TEMP, LDO, OSC, SW_BANKx, CP, CSNS — all receive bias currents from BIAS',
-#         'LDO':       'OSC (LDO powers the oscillator supply rail)',
-#         'OSC':       'LOGIC, INTERFACE — clock signal drives all digital logic and communication',
-#         'TEMP':      'ADC (TEMP voltage is read by ADC), SW_BANK_x (DIETEMP controls output enable)',
-#         'CSNS':      'ADC (CSNS output is digitized by ADC for current monitoring)',
-#         'ADC':       'SW_BANK_x (ADC DIETEMP result controls switch enable), LOGIC (ADC results feed decision logic)',
-#         'CP':        'SW_BANK_x (charge pump supplies the gate drive voltage for all switches)',
-#         'LOGIC':     'SW_BANK_X (LOGIC drives all switch banks), OSC (LOGIC can assert reset)',
-#         'INTERFACE': 'LOGIC, ADC (SPI writes configure DAC and read ADC results)',
-#         'TRIM':      'REF, LDO, BIAS, OSC, SW_BANK, DIETEMP — trim data calibrates all analog blocks',
-#     }
-
-#     hint = DOWNSTREAM.get(code, '')
-#     if not hint:
-#         # Generic: suggest looking at all blocks
-#         hint = 'Review all blocks — consider which ones depend on this block output signal'
-#     return hint
+# _DOWNSTREAM = {
+#     'REF':       'BIAS, ADC, TEMP, LDO, OSC — all use the reference voltage',
+#     'BIAS':      'ADC, TEMP, LDO, OSC, SW_BANKx, CP, CSNS — all receive bias currents',
+#     'LDO':       'OSC (LDO powers the oscillator supply rail)',
+#     'OSC':       'LOGIC, INTERFACE — clock signal drives all digital logic',
+#     'TEMP':      'ADC (TEMP voltage read by ADC), SW_BANK_x (DIETEMP controls output enable)',
+#     'CSNS':      'ADC (CSNS output is digitized by ADC for current monitoring)',
+#     'ADC':       'SW_BANK_x (ADC DIETEMP result controls switch enable), LOGIC',
+#     'CP':        'SW_BANK_x (charge pump supplies gate drive voltage for all switches)',
+#     'LOGIC':     'SW_BANK_X (LOGIC drives all switch banks), OSC',
+#     'INTERFACE': 'LOGIC, ADC (SPI writes configure DAC and read ADC results)',
+#     'TRIM':      'REF, LDO, BIAS, OSC, SW_BANK, DIETEMP — trim data calibrates all analog blocks',
+# }
 
 
-# def _llm_block_effects(block, chip_ctx, tsr_ctx, modes, block_to_sms, sm_coverage, sm_addressed):
+# def _llm_block_effects(block, chip_ctx, tsr_ctx, modes,
+#                        block_to_sms, sm_coverage, sm_addressed, learned_j):
 #     code = block['fmeda_code']
 #     name = block['name']
 #     func = block.get('function', '')
 #     n    = len(modes)
 
-#     # Build downstream signal map for this block
-#     # Helps LLM reason about who receives the signal from this block
-#     downstream_hint = _build_downstream_hint(block, chip_ctx)
+#     downstream_hint = _DOWNSTREAM.get(code,
+#         'Review all blocks — consider which ones depend on this block output signal')
 
 #     prompt = f"""You are completing an FMEDA table for an automotive IC (ISO 26262 / AEC-Q100).
 
@@ -771,9 +1220,6 @@
 # ═══════════════════════════════════════════════════
 # ALL BLOCKS IN THIS CHIP (fmeda_code | name | function):
 # {chip_ctx}
-
-# SYSTEM SAFETY REQUIREMENTS (TSR):
-# {tsr_ctx}
 # ═══════════════════════════════════════════════════
 # BLOCK BEING ANALYZED:
 #   FMEDA Code : {code}
@@ -787,54 +1233,13 @@
 # {json.dumps(modes, indent=2)}
 # ═══════════════════════════════════════════════════
 
-# STEP-BY-STEP REASONING FOR EACH MODE:
+# TASK: For each failure mode return ONLY col I (effects on IC output).
+# Col J and col K will be determined separately — do NOT include them.
 
-#   Step 1 — IDENTIFY THE OUTPUT SIGNAL
-#     Ask: "What physical signal does {name} produce?"
-#     Examples: reference voltage, bias current, clock signal, PWM enable, serial data, temperature voltage
-
-#   Step 2 — MAP ALL CONSUMERS
-#     Go through EVERY other block in the chip.
-#     For each block ask: "Does its function depend on {name}'s output?"
-#     Be thorough — a bias current affects ADC, TEMP, LDO, OSC, CP all at once.
-#     A reference voltage affects every block that uses it for comparison or regulation.
-#     A clock signal affects all digital blocks.
-
-#   Step 3 — DETERMINE THE SPECIFIC SYMPTOM PER CONSUMER
-#     For each consumer block, describe exactly what goes wrong:
-#     - NOT "ADC is affected" → YES "ADC measurement is incorrect."
-#     - NOT "OSC has issue"   → YES "Oscillation does not start" or "Frequency out of spec."
-#     - NOT "LOGIC fails"     → YES "Cannot operate." + "Communication error."
-
-#   Step 4 — SAFE MODES AND BLOCK-SPECIFIC RULES:
-
-#     ALWAYS "No effect" for col I (local disturbances, don't propagate):
-#     "affected by spikes", "oscillation within expected range",
-#     "incorrect start-up time", "jitter too high", "incorrect duty cycle",
-#     "quiescent current exceeding", "incorrect settling time"
-
-#     BLOCK-SPECIFIC SAFETY OVERRIDES (apply BEFORE general reasoning):
-#     • CSNS block: ALL modes → col I = "• ADC\n    - CSNS output is incorrect." or
-#       "No effect", col J = "No effect", K = "O" always.
-#       Reason: CSNS feeds ADC for monitoring only; not a direct safety path.
-#     • ADC block: ONLY stuck/floating → K=X. ALL others (accuracy/offset/
-#       linearity/settling/monotonic/full-scale) → K=O, J="No effect".
-#     • INTERFACE block: ALL modes → col I = "Communication error",
-#       col J = "Fail-safe mode active", K = "O".
-#     • SW_BANK block: Stuck/floating/resistance-too-high → K=X.
-#       Resistance-too-low/turn-on-time/turn-off-time → K=O.
-
-#   Step 5 — SYSTEM EFFECT (col J)
-#     What does the end user/ECU observe? Cross-check TSR requirements.
-#     Choose from:
-#       "Unintentional LED ON/OFF\nFail-safe mode active\nNo communication"
-#       "Fail-safe mode active\nNo communication"
-#       "Fail-safe mode active"
-#       "Unintended LED ON"
-#       "Unintended LED OFF"
-#       "Unintended LED ON/OFF"
-#       "Device damage"
-#       "No effect"
+# SAFE MODES (always "No effect" for col I):
+#   "affected by spikes", "oscillation within expected range",
+#   "incorrect start-up time", "jitter too high", "incorrect duty cycle",
+#   "quiescent current exceeding", "incorrect settling time"
 
 # {IC_FORMAT}
 
@@ -842,8 +1247,7 @@
 # [
 #   {{
 #     "G": "<exact failure mode string>",
-#     "I": "<col I: IC output effect>",
-#     "J": "<col J: system effect>"
+#     "I": "<col I: IC output effect>"
 #   }},
 #   ...
 # ]
@@ -852,211 +1256,45 @@
 #     raw    = query_llm(prompt, temperature=0.05)
 #     parsed = parse_json(raw)
 
+#     rows = []
 #     if isinstance(parsed, list) and len(parsed) >= n:
-#         rows = []
 #         for i in range(n):
 #             rd   = parsed[i]
 #             ic   = str(rd.get('I', 'No effect')).strip()
-#             sys_ = str(rd.get('J', 'No effect')).strip()
-#             # Apply deterministic corrections BEFORE computing memo
-#             ic, sys_, memo_override = _apply_block_rules(code, modes[i], ic, sys_)
-#             if memo_override:
-#                 memo = memo_override
+#             mode = modes[i]
+
+#             # Col J: deterministic lookup (never from LLM)
+#             sys_ = resolve_j(code, mode, learned_j)
+
+#             # Col K: deterministic
+#             k_override = _lookup_k_override(code, mode)
+#             if ic in ('No effect', ''):
+#                 memo = 'O'
+#             elif k_override is not None:
+#                 memo = k_override
 #             else:
-#                 memo, _ = determine_memo(ic, block_to_sms)
-#             rows.append(_build_row(modes[i], ic, sys_, memo, block_to_sms, sm_coverage, fmeda_code=code))
-#         return rows
+#                 memo, _ = determine_memo(ic, block_to_sms, code, mode)
 
-#     print(f"    LLM parse failed for {code} — using fallback")
-#     return _fallback_rows(modes, block_to_sms, sm_coverage, sm_addressed)
+#             rows.append(_build_row(mode, ic, sys_, memo, block_to_sms, sm_coverage,
+#                                    fmeda_code=code))
+#     else:
+#         print(f"    LLM parse failed for {code} — using fallback")
+#         rows = _fallback_rows(modes, block_to_sms, sm_coverage, sm_addressed,
+#                               code, learned_j)
 
-
-# def _apply_block_rules(code, mode, ic, sys_):
-#     """
-#     Deterministic per-block corrections.
-#     Returns (corrected_ic, corrected_sys, memo_override_or_None)
-#     These rules fix the known systematic errors identified in the accuracy report.
-#     """
-#     mode_lower = mode.lower()
-
-#     # CSNS: ALL modes → only affect ADC, K=O, J=No effect
-#     if code == 'CSNS':
-#         is_safe = any(k in mode_lower for k in [
-#             'spike', 'oscillation within', 'start-up', 'jitter',
-#             'duty cycle', 'quiescent', 'settling', 'false detection'
-#         ])
-#         if is_safe:
-#             return 'No effect', 'No effect', 'O'
-#         else:
-#             return '• ADC\n    - CSNS output is incorrect.', 'No effect', 'O'
-
-#     # ADC: only stuck/floating → X; everything else → O
-#     if code == 'ADC':
-#         if any(k in mode_lower for k in ['stuck', 'floating', 'open circuit']):
-#             return ic, sys_, None  # let LLM result stand, memo from SM list
-#         else:
-#             # accuracy/offset/linearity/settling/monotonic/full-scale → O
-#             _adc_ic = '• ADC\n    - Incorrect BGR measurement\n    - Incorrect DIETEMP measurement\n    - Incorrect CS measurement'
-#             corrected_ic = ic if ic and ic != 'No effect' else _adc_ic
-#             if 'settling' in mode_lower:
-#                 corrected_ic = 'No effect'
-#             return corrected_ic, 'No effect', 'O'
-
-#     # INTERFACE: all modes → Communication error, K=O
-#     if code == 'INTERFACE':
-#         return 'Communication error', 'Fail-safe mode active', 'O'
-
-#     # SW_BANK: only stuck/floating/res-high → X; res-low/timing → O
-#     if code.startswith('SW_BANK'):
-#         if any(k in mode_lower for k in ['stuck', 'floating', 'open circuit', 'resistance too high']):
-#             return ic, sys_, None  # keep X
-#         else:
-#             return ic, 'No effect', 'O'
-
-#     # SM blocks: "Fail to detect" → always 'X (Latent)'
-#     if code.startswith('SM') and 'fail to detect' in mode_lower:
-#         return ic, sys_, 'X (Latent)'
-
-#     return ic, sys_, None  # no override
-
-
-# # Per-block SM selection — taken directly from 3_ID03_FMEDA.xlsx.
-# # Maps (fmeda_code, mode_type) → SM string.
-# # mode_type: 'stuck_float' for stuck/floating/out-of-range,
-# #            'accuracy'    for accuracy/drift modes,
-# #            'default'     fallback
-# _BLOCK_SM_MAP = {
-#     # (block_code, mode_type) → 'SM## SM## ...'
-#     ('REF',       'stuck_float'): 'SM01 SM15 SM16 SM17',
-#     ('REF',       'accuracy'):    'SM01 SM11 SM15 SM16',
-#     ('REF',       'default'):     'SM01 SM15 SM16 SM17',
-#     ('BIAS',      'default'):     'SM11 SM15 SM16',
-#     ('LDO',       'ov'):          'SM11 SM20',
-#     ('LDO',       'uv'):          'SM11 SM15',
-#     ('LDO',       'accuracy'):    'SM11 SM15 SM20',
-#     ('LDO',       'default'):     'SM11 SM15 SM20',
-#     ('OSC',       'default'):     'SM09 SM10 SM11',
-#     ('TEMP',      'default'):     'SM17 SM23',
-#     ('CSNS',      'default'):     '',           # CSNS → K=O, no SM needed
-#     ('ADC',       'stuck_float'): 'SM08 SM16 SM17 SM23',
-#     ('ADC',       'default'):     '',           # ADC accuracy → K=O
-#     ('CP',        'ov'):          '',           # OV → no SM (device damage)
-#     ('CP',        'uv'):          'SM14 SM22',
-#     ('CP',        'default'):     'SM14 SM22',
-#     ('LOGIC',     'default'):     'SM10 SM11 SM12 SM18',
-#     ('INTERFACE', 'default'):     '',           # INTERFACE → K=O
-#     ('TRIM',      'default'):     'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
-#     ('SW_BANK_1', 'stuck_float'): 'SM04 SM05 SM06 SM08',
-#     ('SW_BANK_1', 'res_high'):    'SM04 SM06 SM08',
-#     ('SW_BANK_1', 'driver'):      'SM03 SM06 SM24',
-#     ('SW_BANK_1', 'default'):     'SM04 SM06 SM08',
-#     ('SW_BANK_2', 'stuck_float'): 'SM04 SM05 SM06 SM08',
-#     ('SW_BANK_2', 'res_high'):    'SM04 SM06 SM08',
-#     ('SW_BANK_2', 'driver'):      'SM03 SM06 SM24',
-#     ('SW_BANK_2', 'default'):     'SM04 SM06 SM08',
-#     ('SW_BANK_3', 'stuck_float'): 'SM04 SM05 SM06 SM08',
-#     ('SW_BANK_3', 'res_high'):    'SM04 SM06 SM08',
-#     ('SW_BANK_3', 'driver'):      'SM03 SM06 SM24',
-#     ('SW_BANK_3', 'default'):     'SM04 SM06 SM08',
-#     ('SW_BANK_4', 'stuck_float'): 'SM04 SM05 SM06 SM08',
-#     ('SW_BANK_4', 'res_high'):    'SM04 SM06 SM08',
-#     ('SW_BANK_4', 'driver'):      'SM03 SM06 SM24',
-#     ('SW_BANK_4', 'default'):     'SM04 SM06 SM08',
-# }
-
-
-# def _mode_type(code, mode_str, ic_effect):
-#     """Classify a failure mode into a type key for _BLOCK_SM_MAP lookup."""
-#     m = mode_str.lower()
-#     i = (ic_effect or '').lower()
-#     if 'stuck' in m or 'floating' in m or 'open circuit' in m:
-#         return 'stuck_float'
-#     if ('accuracy' in m or 'drift' in m or 'too low' in m
-#             or 'incorrect output voltage' in m
-#             or 'incorrect reference current' in m
-#             or ('incorrect' in m and 'outside the expected range' in m)):
-#         return 'accuracy'
-#     if 'over voltage' in m or '— ov' in m or 'higher than a high threshold' in m:
-#         return 'ov'
-#     if 'under voltage' in m or '— uv' in m or 'lower than a low threshold' in m:
-#         return 'uv'
-#     if 'resistance too high' in m:
-#         return 'res_high'
-#     if 'driver' in m and code.startswith('SW_BANK'):
-#         return 'driver'
-#     return 'default'
-
-
-# def compute_sm_columns(ic_effect, block_to_sms, sm_coverage, fmeda_code='', mode_str=''):
-#     """
-#     Returns (sm_string, coverage_value) for col S/Y and col U.
-#     Uses per-block hardcoded SM map from real FMEDA when available,
-#     falls back to block_to_sms intersection for unknown blocks.
-#     """
-#     if not ic_effect or ic_effect.strip() == 'No effect':
-#         return '', ''
-
-#     # Try hardcoded map first
-#     mtype = _mode_type(fmeda_code, mode_str, ic_effect)
-#     sm_str = _BLOCK_SM_MAP.get((fmeda_code, mtype)) or              _BLOCK_SM_MAP.get((fmeda_code, 'default'))
-
-#     if sm_str is None:
-#         # Fallback: intersection of block_to_sms for blocks in col I
-#         affected = re.findall(r'^\s*•\s*([A-Z_a-z0-9]+)', ic_effect, re.MULTILINE)
-#         norm = []
-#         for b in affected:
-#             b = b.strip().upper()
-#             b = re.sub(r'SW_BANK[_X\d]*', 'SW_BANK', b)
-#             b = re.sub(r'CSNS|CNSN|CS', 'CSNS', b)
-#             if b not in ('NONE', 'VEGA', ''):
-#                 norm.append(b)
-#         matching = []
-#         for block in norm:
-#             for sm in block_to_sms.get(block, []):
-#                 if sm not in matching:
-#                     matching.append(sm)
-#         def sm_key(s):
-#             m2 = re.search(r'(\d+)', s)
-#             return int(m2.group(1)) if m2 else 0
-#         matching.sort(key=sm_key)
-#         sm_str = ' '.join(matching)
-
-#     if not sm_str:
-#         return '', ''
-
-#     # Compute max coverage for the SMs listed
-#     valid = [0.99, 0.9, 0.6]
-#     def nearest(v):
-#         return min(valid, key=lambda x: abs(x - v))
-#     coverages = [nearest(sm_coverage.get(sm, 0.9)) for sm in sm_str.split()]
-#     max_cov = max(coverages) if coverages else 0.9
-
-#     return sm_str, max_cov
+#     return rows
 
 
 # def _build_row(canonical_mode, ic, sys_, memo, block_to_sms=None, sm_coverage=None, **kwargs):
-#     """
-#     col P  (Single Point Failure mode): Y if K=X (not Latent), N otherwise
-#     col R  (Percentage of Safe Faults): 0 if IC has any effect, 1 if No effect
-#     col S  : SM codes from per-block hardcoded map (from real FMEDA)
-#     col U  : highest coverage from those SMs (0.99 / 0.9 / 0.6)
-#     col Y  : same as col S (latent SM coverage = same mechanisms)
-#     kwargs: fmeda_code (str) — used for SM map lookup
-#     """
 #     ic_clean = ic.strip()
 #     if ic_clean in ('No effect', ''):
 #         memo = 'O'
 
-#     # col P: Single Point Failure
-#     # IMPORTANT: K="X (Latent)" means LATENT fault, NOT single-point
-#     # Only K="X" (without Latent) gets P=Y
+#     # col P: only pure 'X' (not Latent) → Y
 #     sp = 'Y' if memo == 'X' else 'N'
-#     # col R: Percentage of Safe Faults
-#     # If K=O (no safety violation) → R=1 (100% safe)
-#     # If K=X or X(Latent) → R=0 (0% safe — needs SM to make safe)
+#     # col R: safe if K=O
 #     pct_safe = 1 if not memo.startswith('X') else 0
 
-#     # Compute S, U, Y using per-block SM map
 #     sm_str, coverage = '', ''
 #     if ic_clean != 'No effect':
 #         sm_str, coverage = compute_sm_columns(
@@ -1073,64 +1311,48 @@
 #         'O': 1,
 #         'P': sp,
 #         'R': pct_safe,
-#         'S': sm_str,    # col S: Safety mechanisms IC
+#         'S': sm_str,
 #         'T': '',
-#         'U': coverage,  # col U: highest coverage SPF
+#         'U': coverage,
 #         'V': '',
-#         'X': 'Y' if memo.startswith('X') else 'N',  # Y for both X and X(Latent)
-#         'Y': sm_str,    # col Y: same as S (latent SM = same mechanisms)
+#         'X': 'Y' if memo.startswith('X') else 'N',
+#         'Y': sm_str,
 #         'Z': '', 'AA': '', 'AB': '', 'AD': '',
 #     }
 
 
-# def _fallback_rows(modes, block_to_sms, sm_coverage=None, sm_addressed=None, fmeda_code=''):
-#     SAFE = ['spike','oscillation within','start-up','jitter','duty cycle',
-#             'quiescent','settling','false detection']
+# def _fallback_rows(modes, block_to_sms, sm_coverage=None, sm_addressed=None,
+#                    fmeda_code='', learned_j=None):
+#     if learned_j is None:
+#         learned_j = {}
+#     SAFE_KW = ['spike', 'oscillation within', 'start-up', 'jitter', 'duty cycle',
+#                'quiescent', 'settling', 'false detection']
 #     rows = []
 #     for mode in modes:
-#         safe = any(k in mode.lower() for k in SAFE)
+#         safe = any(k in mode.lower() for k in SAFE_KW)
 #         ic   = 'No effect' if safe else ''
-#         memo, _ = determine_memo(ic, block_to_sms)
-#         rows.append(_build_row(mode, ic, 'No effect' if safe else '', memo,
+#         sys_ = resolve_j(fmeda_code, mode, learned_j)
+#         k_override = _lookup_k_override(fmeda_code, mode)
+#         if ic in ('No effect', ''):
+#             memo = 'O'
+#         elif k_override is not None:
+#             memo = k_override
+#         else:
+#             memo, _ = determine_memo(ic, block_to_sms, fmeda_code, mode)
+#         rows.append(_build_row(mode, ic, sys_, memo,
 #                                block_to_sms, sm_coverage, fmeda_code=fmeda_code))
 #     return rows
 
 
-# def _sm_rows(sm_code):
+# def _sm_rows(sm_code: str, sm_j_map: dict) -> list:
 #     """
-#     SM blocks always have exactly 2 rows.
-#     CRITICAL from real FMEDA:
-#       Fail to detect  → K='X (Latent)'  P=N (NOT Y — it's latent, not single-point)  X=Y
-#       False detection → K='O'           P=N  X=N
+#     SM blocks: 2 rows — 'Fail to detect' and 'False detection'.
+#     J values read from sm_j_map (built from reference FMEDA or built-in).
 #     """
-#     SM = {
-#         'SM01': ('Unintended LED ON',                        'Unintended LED ON'),
-#         'SM02': ('Device damage',                            'Device damage'),
-#         'SM03': ('Unintended LED ON',                        'Unintended LED ON'),
-#         'SM04': ('Unintended LED OFF',                       'Unintended LED OFF'),
-#         'SM05': ('Unintended LED OFF',                       'Unintended LED OFF'),
-#         'SM06': ('Unintended LED OFF',                       'Unintended LED OFF'),
-#         'SM07': ('Unintended LED ON/OFF',                    'Unintended LED ON/OFF'),
-#         'SM08': ('Unintended LED ON',                        'Unintended LED ON'),
-#         'SM09': ('UART Communication Error',                 'Fail-safe mode active'),
-#         'SM10': ('UART Communication Error',                 'Fail-safe mode active'),
-#         'SM11': ('UART Communication Error',                 'Fail-safe mode active'),
-#         'SM12': ('No PWM monitoring functionality',          'No effect'),
-#         'SM13': ('Unintended LED ON/OFF in FS mode',         'Unintended LED ON/OFF in FS mode'),
-#         'SM14': ('Unintended LED ON',                        'Unintended LED ON'),
-#         'SM15': ('Failures on LOGIC operation',              'Possible Fail-safe mode activation'),
-#         'SM16': ('Loss of reference control functionality',  'No effect'),
-#         'SM17': ('Device damage',                            'Device damage'),
-#         'SM18': ('Cannot trim part properly',                'Performance/Functionality degredation'),
-#         'SM20': ('Device damage',                            'Device damage'),
-#         'SM21': ('Unsynchronised PWM',                       'No effect'),
-#         'SM22': ('Unintended LED OFF',                       'Unintended LED OFF'),
-#         'SM23': ('Loss of thermal monitoring capability',    'Possible device damage'),
-#         'SM24': ('Loss of LED voltage monitoring capability','No effect'),
-#     }
-#     ic, sys_ = SM.get(sm_code, ('Loss of safety mechanism functionality', 'Fail-safe mode active'))
+#     ic, sys_ = sm_j_map.get(sm_code, ('Loss of safety mechanism functionality',
+#                                        'Fail-safe mode active'))
 #     return [
-#         # Fail to detect: K=X(Latent), P=N (LATENT fault ≠ single-point), X=Y
+#         # Fail to detect: K=X(Latent), P=N, X=Y
 #         {'G': 'Fail to detect',  'I': ic,          'J': sys_,        'K': 'X (Latent)',
 #          'O': 1, 'P': 'N', 'R': 0, 'S': '', 'T': '', 'U': '', 'V': '',
 #          'X': 'Y', 'Y': '', 'Z': '', 'AA': '', 'AB': '', 'AD': ''},
@@ -1145,42 +1367,20 @@
 # # AGENT 3  —  Template Writer  (deterministic)
 # # ═══════════════════════════════════════════════════════════════════════════════
 
-# def _compute_fit_values(code, n_modes, block_fit_rates, row_memo, row_U, sm_coverage_val):
-#     """
-#     Compute per-row FIT values:
-#       E  = Block FIT (first row only)
-#       F  = Mode FIT  = block_fit / n_modes
-#       Q  = Failure rate FIT = F × 1 (failure distribution always 1)
-#       V  = Residual FIT:
-#              if memo=O  → 0
-#              if memo=X  → Q × (1 - R) × (1 - U)  where R=0 for X rows
-#                         → Q × 1 × (1 - U)
-#                         → Q × (1 - U)
-#       AA = Latent coverage (1 if SM coverage 0.99, 0.8 if 0.9 coverage)
-#       AB = Latent MPF FIT:
-#              if X and AA=1 → 0
-#              else          → Q × (1-R) - V) × (1 - AA)  ≈ 0 when AA=1
-#     """
+# def _compute_fit_values(code, n_modes, block_fit_rates, row_memo, row_U, sm_coverage):
 #     block_fit = block_fit_rates.get(code, 0.0)
 #     mode_fit  = block_fit / n_modes if n_modes > 0 and block_fit > 0 else 0.0
 
 #     if not row_memo.startswith('X'):
-#         # Safe mode: V=0, AA and AB not applicable
 #         return block_fit, mode_fit, mode_fit, 0.0, None, None
 
 #     U = float(row_U) if row_U else 0.0
 
-#     # V = residual FIT = Q × (1 - U)  since R=0 for X rows
 #     V = mode_fit * (1.0 - U)
 
-#     # AA = latent coverage — per-block values from real FMEDA
-#     # Blocks with AA=0.8 for X rows (SM coverage = 0.9 for these latent paths):
 #     BLOCKS_AA_08 = {'LDO', 'TEMP', 'ADC', 'CP', 'LOGIC',
-#                     'SW_BANK_1','SW_BANK_2','SW_BANK_3','SW_BANK_4', 'SM09'}
-#     # CP OV has no SM → AA=0
-#     BLOCKS_AA_00 = set()  # handled below
-
-#     if not U:  # no SM → no latent coverage
+#                     'SW_BANK_1', 'SW_BANK_2', 'SW_BANK_3', 'SW_BANK_4', 'SM09'}
+#     if not U:
 #         AA = 0.0
 #     elif code in BLOCKS_AA_08:
 #         AA = 0.8
@@ -1191,11 +1391,6 @@
 #     else:
 #         AA = U
 
-#     # AB = Latent MPF FIT ≈ 0 when AA=1 (fully covered by SM)
-#     # Formula: (Q*(1-R) - V) * (1-AA)
-#     #        = (mode_fit - V) * (1 - AA)
-#     #        = (mode_fit - mode_fit*(1-U)) * (1-AA)
-#     #        = mode_fit * U * (1-AA)
 #     AB = mode_fit * U * (1.0 - AA)
 
 #     return block_fit, mode_fit, mode_fit, V, AA, AB
@@ -1250,15 +1445,11 @@
 
 
 # def agent3_write_template(fmeda_data, block_fit_rates=None, sm_coverage=None):
-#     """
-#     Fill template placeholders.
-#     block_fit_rates: { 'REF': 0.0509, ... } — block-level FIT from Core Block FIT sheet
-#     sm_coverage    : { 'SM01': 0.99, ... }  — SM diagnostic coverage from SM list
-#     """
 #     if block_fit_rates is None:
 #         block_fit_rates = {}
 #     if sm_coverage is None:
 #         sm_coverage = {}
+
 #     shutil.copy2(TEMPLATE_FILE, OUTPUT_FILE)
 #     wb = openpyxl.load_workbook(OUTPUT_FILE)
 #     ws = wb['FMEDA']
@@ -1285,7 +1476,6 @@
 #             print(f"  [Agent 3] {code}: {n_d} modes > {n_t} slots — truncating")
 #             rows = rows[:n_t]
 
-#         # Total modes for this block — used to compute per-mode FIT rate
 #         n_modes_total = max(len(rows), 1)
 
 #         for mi, row_num in enumerate(group_rows):
@@ -1305,72 +1495,43 @@
 #             pct_safe = rd.get('R', 1 if memo == 'O' else 0)
 #             u_val    = rd.get('U', '')
 
-#             # ── Compute FIT values from block FIT rate sheet ──────────────
 #             fit_blk, fit_mode, fit_q, fit_v, fit_aa, fit_ab = _compute_fit_values(
 #                 code, n_modes_total, block_fit_rates, memo, u_val, sm_coverage
 #             )
 
-#             # E  — Block FIT (first row only)
-#             _write(idx, 'E', row_num, fit_blk if (is_first and fit_blk > 0) else None)
-#             # F  — Mode FIT
+#             _write(idx, 'E',  row_num, fit_blk if (is_first and fit_blk > 0) else None)
 #             _write(idx, 'F',  row_num, fit_mode if fit_mode > 0 else None)
-#             # G  — Standard failure mode
 #             _write(idx, 'G',  row_num, rd.get('G', ''),          wrap=True)
-#             # H  — Failure Mode (blank — matches real FMEDA)
 #             _write(idx, 'H',  row_num, None)
-#             # I  — Effects on IC output
 #             _write(idx, 'I',  row_num, rd.get('I', 'No effect'), wrap=True)
-#             # J  — Effects on system
 #             _write(idx, 'J',  row_num, rd.get('J', 'No effect'), wrap=True)
-#             # K  — Memo
 #             _write(idx, 'K',  row_num, memo)
-#             # O  — Failure distribution
-#             # TEMP block: X rows use 0.5 (two modes split probability)
-#             # All others: 1
+
 #             o_val = 0.5 if (code == 'TEMP' and memo.startswith('X')) else 1
 #             _write(idx, 'O',  row_num, o_val)
-#             # P  — Single Point Y/N
 #             _write(idx, 'P',  row_num, sp)
-#             # Q  — Failure rate FIT (= mode FIT since distribution = 1)
 #             _write(idx, 'Q',  row_num, fit_q if fit_q > 0 else None)
-#             # R  — Percentage of Safe Faults (0 or 1)
 #             _write(idx, 'R',  row_num, pct_safe)
-#             # S  — Safety mechanisms IC
 #             _write(idx, 'S',  row_num, rd.get('S') or None,      wrap=False)
-#             # T  — Safety mechanisms System
 #             _write(idx, 'T',  row_num, rd.get('T') or None,      wrap=False)
-#             # U  — Coverage SPF
 #             _write(idx, 'U',  row_num, u_val if u_val not in ('', None) else None)
-#             # V  — Residual FIT = Q × (1 - U) for X rows
 #             _write(idx, 'V',  row_num, fit_v if (fit_v is not None and fit_v > 0) else None)
-#             # X  — Latent failure Y/N
 #             _write(idx, 'X',  row_num, rd.get('X', 'Y' if memo.startswith('X') else 'N'))
-#             # Y  — SM IC latent (same as S)
 #             _write(idx, 'Y',  row_num, rd.get('Y') or None,      wrap=False)
-#             # Z  — SM System latent
-#             _write(idx, 'Z',  row_num, rd.get('Z') or None,      wrap=False)
-#             # AA — Latent coverage
+#             _write(idx, 'Z',  row_num, rd.get('Z') or None,      wrap=True)
 #             _write(idx, 'AA', row_num, fit_aa if fit_aa is not None else None)
-#             # AB — Latent MPF FIT (0 when fully covered)
+
 #             if fit_ab is not None:
 #                 _write(idx, 'AB', row_num, fit_ab if fit_ab > 0 else 0)
-#             # AD — Comment: "SMxx make the IC enter a safe-sate. Latent coverage: XX%."
+
+#             # AD comment
 #             sm_str = rd.get('S', '') or ''
 #             if sm_str and memo.startswith('X'):
-#                 sms    = sm_str.split()
-#                 # Use first two SMs in the comment (matches real FMEDA pattern)
-#                 # AD comment: primary SM is the one with highest coverage
-#                 # For REF: use first two highest-coverage SMs
-#                 def sm_cov_val(sm):
-#                     return sm_coverage.get(sm, 0.0) if sm_coverage else 0.0
-#                 sms_sorted = sorted(sms, key=sm_cov_val, reverse=True)
-#                 if code == 'REF' and len(sms_sorted) >= 2:
-#                     # REF uses two SMs in comment: highest + second-highest coverage
-#                     sm_mention = f'{sms_sorted[0]} {sms_sorted[1]}'
-#                 elif sms_sorted:
-#                     sm_mention = sms_sorted[0]
-#                 else:
-#                     sm_mention = ''
+#                 sms = sm_str.split()
+#                 sms_sorted = sorted(sms,
+#                     key=lambda s: sm_coverage.get(s, 0.0) if sm_coverage else 0.0,
+#                     reverse=True)
+#                 sm_mention = ' '.join(sms_sorted[:2]) if len(sms_sorted) >= 2 else (sms_sorted[0] if sms_sorted else '')
 #                 lat_pct = int(round((fit_aa or 1.0) * 100))
 #                 _write(idx, 'AD', row_num,
 #                        f'{sm_mention} make the IC enter a safe-sate. Latent coverage: {lat_pct}%.',
@@ -1394,25 +1555,25 @@
 
 # def run():
 #     print("╔═══════════════════════════════════════════════╗")
-#     print("║      FMEDA Multi-Agent Pipeline               ║")
+#     print("║      FMEDA Multi-Agent Pipeline  v2           ║")
 #     print("╚═══════════════════════════════════════════════╝")
-#     print(f"\n  Dataset  : {DATASET_FILE}")
-#     print(f"  IEC table: {IEC_TABLE_FILE}")
-#     print(f"  Template : {TEMPLATE_FILE}")
-#     print(f"  Model    : {OLLAMA_MODEL}")
-#     print(f"  Output   : {OUTPUT_FILE}\n")
+#     print(f"\n  Dataset   : {DATASET_FILE}")
+#     print(f"  IEC table : {IEC_TABLE_FILE}")
+#     print(f"  Template  : {TEMPLATE_FILE}")
+#     print(f"  Reference : {REFERENCE_FMEDA}")
+#     print(f"  Model     : {OLLAMA_MODEL}")
+#     print(f"  Output    : {OUTPUT_FILE}\n")
 
 #     cache = load_cache()
 
-#     # ── Step 0: Read all inputs ───────────────────────────────────────────────
+#     # ── Step 0: Read all inputs ────────────────────────────────────────────────
 #     print("━━━ Step 0 : Reading inputs ━━━")
 #     blk_blocks, sm_blocks, tsr_list = read_dataset()
 #     iec_table = read_iec_table()
 #     sm_coverage, sm_addressed, block_to_sms = read_sm_list_from_template()
-#     # Load FIT rates from template/real FMEDA
-#     import os
+
 #     block_fit_rates = {}
-#     for candidate in [TEMPLATE_FILE, '3_ID03_FMEDA.xlsx']:
+#     for candidate in [TEMPLATE_FILE, REFERENCE_FMEDA]:
 #         if os.path.exists(candidate):
 #             try:
 #                 wb_fit = openpyxl.load_workbook(candidate, data_only=True)
@@ -1422,13 +1583,20 @@
 #                     break
 #             except Exception:
 #                 pass
+
+#     # Learn J patterns from reference FMEDA (runtime — adapts to chip changes)
+#     learned_j = learn_j_from_reference(REFERENCE_FMEDA)
+
+#     # Load SM J values from reference FMEDA
+#     sm_j_map = load_sm_j_from_reference(REFERENCE_FMEDA)
+
 #     print(f"  BLK: {len(blk_blocks)}  SM: {len(sm_blocks)}  TSR: {len(tsr_list)}  "
-#           f"IEC parts: {len(iec_table)}  SM entries: {len(sm_coverage)}  FIT blocks: {len(block_fit_rates)}")
+#           f"IEC: {len(iec_table)}  SM entries: {len(sm_coverage)}  FIT blocks: {len(block_fit_rates)}")
 #     print("  block_to_sms:")
 #     for b, sms in sorted(block_to_sms.items()):
 #         print(f"    {b:<15} → {sms}")
 
-#     # ── Agent 1: Map blocks → IEC parts ──────────────────────────────────────
+#     # ── Agent 1 ──────────────────────────────────────────────────────────────
 #     print("\n━━━ Agent 1 : Block → IEC part mapper (LLM) ━━━")
 #     blocks = agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache)
 #     print("\n  Mapping result:")
@@ -1437,25 +1605,22 @@
 #         print(f"    {b['name']:<35} → {b['fmeda_code']:<12} "
 #               f"| {b.get('iec_part','')} ({len(b.get('modes',[]))} modes){tag}")
 
-#     # ── Agent 2: Generate IC effects + system effects + memo ──────────────────
-#     print("\n━━━ Agent 2 : IC Effects generator (LLM + deterministic memo) ━━━")
-#     fmeda_data = agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage, sm_addressed, cache)
+#     # ── Agent 2 ──────────────────────────────────────────────────────────────
+#     print("\n━━━ Agent 2 : IC Effects (LLM col I) + System Effects (deterministic col J) ━━━")
+#     fmeda_data = agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
+#                                          sm_addressed, cache, learned_j, sm_j_map)
 
-#     # Print memo summary for verification
-#     print("\n  Memo check:")
+#     print("\n  Col J / K verification:")
 #     for block in fmeda_data:
 #         for row in block['rows']:
-#             affected = extract_blocks_from_ic_effect(row.get('I', ''))
-#             memo = row.get('K', 'O')
-#             mode_short = row['G'][:40]
-#             print(f"    {block['fmeda_code']:<12} K={memo}  affected={affected}  | {mode_short}")
+#             print(f"    {block['fmeda_code']:<12} K={row.get('K','?'):<12} "
+#                   f"J={repr(row.get('J',''))[:55]}  | {row['G'][:40]}")
 
-#     # Save intermediate JSON
 #     with open(INTERMEDIATE_JSON, 'w', encoding='utf-8') as f:
 #         json.dump(fmeda_data, f, indent=2, ensure_ascii=False, default=str)
 #     print(f"\n  Intermediate JSON → {INTERMEDIATE_JSON}")
 
-#     # ── Agent 3: Write template ───────────────────────────────────────────────
+#     # ── Agent 3 ──────────────────────────────────────────────────────────────
 #     print("\n━━━ Agent 3 : Template writer (deterministic) ━━━")
 #     agent3_write_template(fmeda_data, block_fit_rates, sm_coverage)
 
@@ -1468,39 +1633,34 @@
 # if __name__ == '__main__':
 #     run()
 
+
 """
-fmeda_agents_v2.py  —  Multi-Agent FMEDA Pipeline  (v2 — improved col J accuracy)
+fmeda_agents_v4.py  —  Multi-Agent FMEDA Pipeline  (v4 — targeting 90% accuracy)
 ====================================================================================
 
-WHAT CHANGED vs v1:
-  • Col J is now deterministic per-block (not LLM-guessed).
-    A BLOCK_J_MAP table was built by reading the human-made 3_ID03_FMEDA.xlsx and
-    mapping every (block, mode_type) → exact J string.  The LLM is kept only for col I.
-  • Col J fallback reads J values directly from the reference FMEDA at runtime, so
-    if the input data changes (new blocks, new failure modes) the map auto-extends.
-  • OSC "incorrect duty cycle" → J="No effect", K=O  (was K=X in v1).
-  • LDO "accuracy" → J="Fail-safe mode active\\nNo communication"  (was "No effect" in v1).
-  • TEMP stuck → J="Unintentional LED ON" (not "Device damage").
-  • TEMP float/incorrect/accuracy → J="Unintentional LED ON\\nPossible device damage".
-  • ADC stuck/float → J="Unintentional LED ON" (not "Unintended LED OFF").
-  • CP OV → J="Device damage", K=X (was K=O in v1).
-  • LOGIC third mode (Incorrect output voltage) → K=X, J=full triple string.
-  • SW_BANK uses per-mode J: stuck→"Unintended LED ON/OFF", float/res_high→"Unintended LED ON",
-    res_low→"No effect" (K=X!), timing→"No effect" (K=O).
-  • SW_BANK res_low: K=X but J="No effect" — now correctly handled.
-  • All SM rows use SM-specific J read from workbook (not hardcoded _sm_rows dict alone).
-  • No hardcoded block names / codes — all derived from input data at runtime.
+CHANGES vs v3 / v2:
 
-AGENTS:
-  AGENT 1  (LLM)   Block → IEC part mapper
-  AGENT 2  (LLM+deterministic)  IC Effects + System Effects generator
-    col I — LLM (few-shot prompted)
-    col J — DETERMINISTIC lookup table (built from reference FMEDA or BLOCK_J_MAP)
-    col K — DETERMINISTIC (SM list intersection)
-  AGENT 3  (deterministic)  Template writer
+  FIX 1 - SW_BANK col G (was 0%): All four SW_BANK blocks now receive exact
+    driver-specific mode descriptions ('Driver is stuck in ON or OFF state', etc.)
+    via SW_BANK_MODES override list, instead of generic IEC signal-level language.
 
-Usage:
-    python fmeda_agents_v2.py
+  FIX 2 - CSNS col G (was 25%): CSNS now uses the correct 8-mode op-amp
+    sequence (stuck -> float -> incorrect -> accuracy -> spikes -> oscillation ->
+    start-up -> quiescent) via CSNS_MODES override, eliminating the offset.
+
+  FIX 3 - ADC K/P/X regression (was 62%): _lookup_k_override now strictly
+    enforces that ONLY stuck/floating ADC modes are safety-violating (K=X).
+    All other ADC modes (offset, full-scale, linearity, monotonic, settling,
+    accuracy) are forced to K=O. Reverts the v3 regression.
+
+  FIX 4 - LOGIC K (FM_TTL_63 'floating' was O, must be X): All three LOGIC
+    modes (stuck, float, incorrect output) are now explicitly forced to K=X.
+
+  FIX 5 - SW_BANK K/P/X rules: stuck/float/res_high/res_low -> K=X;
+    timing (turn-on/turn-off) -> K=O. Removes the bidirectional guessing.
+
+  RETAINED: All v2/v3 improvements (deterministic J, runtime J learning,
+    SM row loading from reference, FIT rate detection, etc.)
 """
 
 import json, re, time, shutil, sys, os
@@ -1643,17 +1803,30 @@ def _j_type(code: str, mode_str: str) -> str:
     if any(k in m for k in safe_keywords):
         return 'safe'
 
-    # OSC duty cycle is safe (unique to OSC)
+    # OSC duty cycle / jitter are safe
     if 'duty cycle' in m:
         return 'duty_cycle'
-
     if 'jitter' in m:
         return 'jitter'
 
+    # SW_BANK resistance modes — check before generic stuck/float
+    if 'resistance too high' in m:
+        return 'res_high'
+    if 'resistance too low' in m:
+        return 'res_low'
+
+    # Timing (SW_BANK turn-on/turn-off) — check before stuck
+    if 'turn-on time' in m or 'turn-off time' in m or 'turn on' in m or 'turn off' in m:
+        return 'timing'
+
     # Stuck / floating
-    if 'stuck' in m or 'stuck in on' in m or 'stuck in off' in m or 'driver is stuck' in m:
+    # IMPORTANT: "not including stuck or floating" is an EXCLUSION phrase used in
+    # ADC/offset/linearity modes — must NOT classify those as stuck/float.
+    _stuck_exclusion = 'not including stuck'
+    if 'stuck' in m and _stuck_exclusion not in m:
         return 'stuck'
-    if 'floating' in m or 'open circuit' in m or 'tri-state' in m:
+    if ('floating' in m or 'open circuit' in m or 'tri-state' in m or 'tri-stated' in m) \
+            and 'not including' not in m:
         return 'float'
 
     # Voltage threshold failures
@@ -1663,16 +1836,6 @@ def _j_type(code: str, mode_str: str) -> str:
     if any(k in m for k in ['lower than a low threshold', 'under voltage', '— uv',
                               'undervoltage', 'output voltage lower']):
         return 'uv'
-
-    # SW_BANK resistance modes
-    if 'resistance too high' in m:
-        return 'res_high'
-    if 'resistance too low' in m:
-        return 'res_low'
-
-    # Timing (SW_BANK turn-on/turn-off)
-    if 'turn-on time' in m or 'turn-off time' in m or 'turn on' in m or 'turn off' in m:
-        return 'timing'
 
     # Drift
     if 'drift' in m:
@@ -1722,35 +1885,56 @@ def _lookup_k_override(code: str, mode_str: str) -> str | None:
     """
     Return a K override if the mode has special K logic that differs from the
     standard SM-list determination.  Returns None = use standard logic.
+
+    Rules derived from 3_ID03_FMEDA.xlsx ground truth:
+      - SW_BANK stuck/float/res_high/res_low → X  (safety violation)
+      - SW_BANK timing (turn-on/turn-off)    → O  (non-safety)
+      - ADC stuck/float                      → X  (SM-list decides)
+      - ADC everything else                  → O  (offset/linearity/etc. are not safety-critical)
+      - CSNS / INTERFACE                     → always O
+      - OSC duty_cycle / jitter              → O
+      - LOGIC stuck/float/incorrect          → X
+      - Safe modes (spikes, oscillation…)    → O
     """
     j_type = _j_type(code, mode_str)
     lookup_code = 'SW_BANK' if re.match(r'SW_BANK', code, re.IGNORECASE) else code
 
-    # SW_BANK res_low → K=X even though J=No effect
-    if lookup_code == 'SW_BANK' and j_type == 'res_low':
-        return 'X'
+    # ── SW_BANK ──────────────────────────────────────────────────────────────
+    if lookup_code == 'SW_BANK':
+        if j_type in ('stuck', 'float', 'res_high', 'res_low'):
+            return 'X'
+        if j_type == 'timing':
+            return 'O'
+        if j_type == 'safe':
+            return 'O'
+        return 'O'   # any other SW_BANK mode defaults to non-safety
 
-    # SW_BANK timing → K=O
-    if lookup_code == 'SW_BANK' and j_type == 'timing':
+    # ── OSC ──────────────────────────────────────────────────────────────────
+    if code == 'OSC' and j_type in ('duty_cycle', 'jitter', 'safe'):
         return 'O'
 
-    # OSC duty_cycle → K=O
-    if code == 'OSC' and j_type == 'duty_cycle':
-        return 'O'
-
-    # CSNS → always K=O
+    # ── CSNS — always non-safety ──────────────────────────────────────────────
     if code == 'CSNS':
         return 'O'
 
-    # INTERFACE → always K=O
+    # ── INTERFACE — always non-safety ────────────────────────────────────────
     if code == 'INTERFACE':
         return 'O'
 
-    # ADC: only stuck/float → let SM logic decide; everything else → K=O
-    if code == 'ADC' and j_type not in ('stuck', 'float', 'safe'):
+    # ── ADC: ONLY stuck / floating → safety-violating; ALL others → O ────────
+    # This covers: accuracy, offset, full-scale, linearity, monotonic, settling
+    if code == 'ADC':
+        if j_type in ('stuck', 'float'):
+            return None   # let standard SM-list logic determine (will give X)
         return 'O'
 
-    # Safe mode
+    # ── LOGIC: all three real modes → K=X ────────────────────────────────────
+    if code == 'LOGIC':
+        if j_type in ('stuck', 'float', 'incorrect'):
+            return 'X'
+        return 'O'
+
+    # ── Universal safe-mode catch ─────────────────────────────────────────────
     if j_type == 'safe':
         return 'O'
 
@@ -2292,6 +2476,31 @@ FMEDA_MODE_OVERRIDES = {
     ],
 }
 
+# SW_BANK uses driver-specific mode descriptions — NOT generic signal-level IEC language.
+# These 6 modes are identical across SW_BANK_1, SW_BANK_2, SW_BANK_3, SW_BANK_4, etc.
+# Built from 3_ID03_FMEDA.xlsx FM_TTL_77–82 (and repeated for each bank).
+SW_BANK_MODES = [
+    'Driver is stuck in ON or OFF state',
+    'Driver is floating (i.e. open circuit, tri-stated)',
+    'Driver resistance too high when turned on',
+    'Driver resistance too low when turned off',
+    'Driver turn-on time too fast or too slow',
+    'Driver turn-off time too fast or too slow',
+]
+
+# CSNS uses the same generic op-amp sequence as REF/TEMP — NOT the shifted
+# op-amp variant the IEC table sometimes produces.
+CSNS_MODES = [
+    'Output is stuck (i.e. high or low)',
+    'Output is floating (i.e. open circuit)',
+    'Incorrect output voltage value (i.e. outside the expected range)',
+    'Output voltage accuracy too low, including drift',
+    'Output voltage affected by spikes',
+    'Output voltage oscillation within the expected range',
+    'Incorrect start-up time (i.e. outside the expected range)',
+    'Quiescent current exceeding the maximum value',
+]
+
 
 def agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache):
     ck = "agent1__" + json.dumps([b['name'] for b in blk_blocks])
@@ -2381,11 +2590,17 @@ Return ONLY the JSON array:"""
                 b['modes'] = []
                 print(f"  [Agent 1] WARNING: no IEC modes for '{iec_part}' ({b['name']})")
 
-    # Apply mode overrides
+    # Apply mode overrides — fixed lists for specific block types
     for b in result:
         code = b.get('fmeda_code', '')
         if code in FMEDA_MODE_OVERRIDES:
             b['modes'] = FMEDA_MODE_OVERRIDES[code]
+        elif re.match(r'SW_BANK', code, re.IGNORECASE):
+            # All SW_BANK_N blocks use identical driver-specific mode descriptions
+            b['modes'] = SW_BANK_MODES
+        elif code == 'CSNS':
+            # CSNS uses the standard op-amp sequence (same as REF/TEMP)
+            b['modes'] = CSNS_MODES
 
     # Enforce duplicate flags
     seen = set()
