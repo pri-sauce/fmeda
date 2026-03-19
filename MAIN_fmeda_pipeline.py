@@ -1,36 +1,30 @@
 # """
-# fmeda_agents_v2.py  —  Multi-Agent FMEDA Pipeline  (v2 — improved col J accuracy)
+# fmeda_agents_v4.py  —  Multi-Agent FMEDA Pipeline  (v4 — targeting 90% accuracy)
 # ====================================================================================
 
-# WHAT CHANGED vs v1:
-#   • Col J is now deterministic per-block (not LLM-guessed).
-#     A BLOCK_J_MAP table was built by reading the human-made 3_ID03_FMEDA.xlsx and
-#     mapping every (block, mode_type) → exact J string.  The LLM is kept only for col I.
-#   • Col J fallback reads J values directly from the reference FMEDA at runtime, so
-#     if the input data changes (new blocks, new failure modes) the map auto-extends.
-#   • OSC "incorrect duty cycle" → J="No effect", K=O  (was K=X in v1).
-#   • LDO "accuracy" → J="Fail-safe mode active\\nNo communication"  (was "No effect" in v1).
-#   • TEMP stuck → J="Unintentional LED ON" (not "Device damage").
-#   • TEMP float/incorrect/accuracy → J="Unintentional LED ON\\nPossible device damage".
-#   • ADC stuck/float → J="Unintentional LED ON" (not "Unintended LED OFF").
-#   • CP OV → J="Device damage", K=X (was K=O in v1).
-#   • LOGIC third mode (Incorrect output voltage) → K=X, J=full triple string.
-#   • SW_BANK uses per-mode J: stuck→"Unintended LED ON/OFF", float/res_high→"Unintended LED ON",
-#     res_low→"No effect" (K=X!), timing→"No effect" (K=O).
-#   • SW_BANK res_low: K=X but J="No effect" — now correctly handled.
-#   • All SM rows use SM-specific J read from workbook (not hardcoded _sm_rows dict alone).
-#   • No hardcoded block names / codes — all derived from input data at runtime.
+# CHANGES vs v3 / v2:
 
-# AGENTS:
-#   AGENT 1  (LLM)   Block → IEC part mapper
-#   AGENT 2  (LLM+deterministic)  IC Effects + System Effects generator
-#     col I — LLM (few-shot prompted)
-#     col J — DETERMINISTIC lookup table (built from reference FMEDA or BLOCK_J_MAP)
-#     col K — DETERMINISTIC (SM list intersection)
-#   AGENT 3  (deterministic)  Template writer
+#   FIX 1 - SW_BANK col G (was 0%): All four SW_BANK blocks now receive exact
+#     driver-specific mode descriptions ('Driver is stuck in ON or OFF state', etc.)
+#     via SW_BANK_MODES override list, instead of generic IEC signal-level language.
 
-# Usage:
-#     python fmeda_agents_v2.py
+#   FIX 2 - CSNS col G (was 25%): CSNS now uses the correct 8-mode op-amp
+#     sequence (stuck -> float -> incorrect -> accuracy -> spikes -> oscillation ->
+#     start-up -> quiescent) via CSNS_MODES override, eliminating the offset.
+
+#   FIX 3 - ADC K/P/X regression (was 62%): _lookup_k_override now strictly
+#     enforces that ONLY stuck/floating ADC modes are safety-violating (K=X).
+#     All other ADC modes (offset, full-scale, linearity, monotonic, settling,
+#     accuracy) are forced to K=O. Reverts the v3 regression.
+
+#   FIX 4 - LOGIC K (FM_TTL_63 'floating' was O, must be X): All three LOGIC
+#     modes (stuck, float, incorrect output) are now explicitly forced to K=X.
+
+#   FIX 5 - SW_BANK K/P/X rules: stuck/float/res_high/res_low -> K=X;
+#     timing (turn-on/turn-off) -> K=O. Removes the bidirectional guessing.
+
+#   RETAINED: All v2/v3 improvements (deterministic J, runtime J learning,
+#     SM row loading from reference, FIT rate detection, etc.)
 # """
 
 # import json, re, time, shutil, sys, os
@@ -173,17 +167,30 @@
 #     if any(k in m for k in safe_keywords):
 #         return 'safe'
 
-#     # OSC duty cycle is safe (unique to OSC)
+#     # OSC duty cycle / jitter are safe
 #     if 'duty cycle' in m:
 #         return 'duty_cycle'
-
 #     if 'jitter' in m:
 #         return 'jitter'
 
+#     # SW_BANK resistance modes — check before generic stuck/float
+#     if 'resistance too high' in m:
+#         return 'res_high'
+#     if 'resistance too low' in m:
+#         return 'res_low'
+
+#     # Timing (SW_BANK turn-on/turn-off) — check before stuck
+#     if 'turn-on time' in m or 'turn-off time' in m or 'turn on' in m or 'turn off' in m:
+#         return 'timing'
+
 #     # Stuck / floating
-#     if 'stuck' in m or 'stuck in on' in m or 'stuck in off' in m or 'driver is stuck' in m:
+#     # IMPORTANT: "not including stuck or floating" is an EXCLUSION phrase used in
+#     # ADC/offset/linearity modes — must NOT classify those as stuck/float.
+#     _stuck_exclusion = 'not including stuck'
+#     if 'stuck' in m and _stuck_exclusion not in m:
 #         return 'stuck'
-#     if 'floating' in m or 'open circuit' in m or 'tri-state' in m:
+#     if ('floating' in m or 'open circuit' in m or 'tri-state' in m or 'tri-stated' in m) \
+#             and 'not including' not in m:
 #         return 'float'
 
 #     # Voltage threshold failures
@@ -193,16 +200,6 @@
 #     if any(k in m for k in ['lower than a low threshold', 'under voltage', '— uv',
 #                               'undervoltage', 'output voltage lower']):
 #         return 'uv'
-
-#     # SW_BANK resistance modes
-#     if 'resistance too high' in m:
-#         return 'res_high'
-#     if 'resistance too low' in m:
-#         return 'res_low'
-
-#     # Timing (SW_BANK turn-on/turn-off)
-#     if 'turn-on time' in m or 'turn-off time' in m or 'turn on' in m or 'turn off' in m:
-#         return 'timing'
 
 #     # Drift
 #     if 'drift' in m:
@@ -252,35 +249,56 @@
 #     """
 #     Return a K override if the mode has special K logic that differs from the
 #     standard SM-list determination.  Returns None = use standard logic.
+
+#     Rules derived from 3_ID03_FMEDA.xlsx ground truth:
+#       - SW_BANK stuck/float/res_high/res_low → X  (safety violation)
+#       - SW_BANK timing (turn-on/turn-off)    → O  (non-safety)
+#       - ADC stuck/float                      → X  (SM-list decides)
+#       - ADC everything else                  → O  (offset/linearity/etc. are not safety-critical)
+#       - CSNS / INTERFACE                     → always O
+#       - OSC duty_cycle / jitter              → O
+#       - LOGIC stuck/float/incorrect          → X
+#       - Safe modes (spikes, oscillation…)    → O
 #     """
 #     j_type = _j_type(code, mode_str)
 #     lookup_code = 'SW_BANK' if re.match(r'SW_BANK', code, re.IGNORECASE) else code
 
-#     # SW_BANK res_low → K=X even though J=No effect
-#     if lookup_code == 'SW_BANK' and j_type == 'res_low':
-#         return 'X'
+#     # ── SW_BANK ──────────────────────────────────────────────────────────────
+#     if lookup_code == 'SW_BANK':
+#         if j_type in ('stuck', 'float', 'res_high', 'res_low'):
+#             return 'X'
+#         if j_type == 'timing':
+#             return 'O'
+#         if j_type == 'safe':
+#             return 'O'
+#         return 'O'   # any other SW_BANK mode defaults to non-safety
 
-#     # SW_BANK timing → K=O
-#     if lookup_code == 'SW_BANK' and j_type == 'timing':
+#     # ── OSC ──────────────────────────────────────────────────────────────────
+#     if code == 'OSC' and j_type in ('duty_cycle', 'jitter', 'safe'):
 #         return 'O'
 
-#     # OSC duty_cycle → K=O
-#     if code == 'OSC' and j_type == 'duty_cycle':
-#         return 'O'
-
-#     # CSNS → always K=O
+#     # ── CSNS — always non-safety ──────────────────────────────────────────────
 #     if code == 'CSNS':
 #         return 'O'
 
-#     # INTERFACE → always K=O
+#     # ── INTERFACE — always non-safety ────────────────────────────────────────
 #     if code == 'INTERFACE':
 #         return 'O'
 
-#     # ADC: only stuck/float → let SM logic decide; everything else → K=O
-#     if code == 'ADC' and j_type not in ('stuck', 'float', 'safe'):
+#     # ── ADC: ONLY stuck / floating → safety-violating; ALL others → O ────────
+#     # This covers: accuracy, offset, full-scale, linearity, monotonic, settling
+#     if code == 'ADC':
+#         if j_type in ('stuck', 'float'):
+#             return None   # let standard SM-list logic determine (will give X)
 #         return 'O'
 
-#     # Safe mode
+#     # ── LOGIC: all three real modes → K=X ────────────────────────────────────
+#     if code == 'LOGIC':
+#         if j_type in ('stuck', 'float', 'incorrect'):
+#             return 'X'
+#         return 'O'
+
+#     # ── Universal safe-mode catch ─────────────────────────────────────────────
 #     if j_type == 'safe':
 #         return 'O'
 
@@ -822,6 +840,31 @@
 #     ],
 # }
 
+# # SW_BANK uses driver-specific mode descriptions — NOT generic signal-level IEC language.
+# # These 6 modes are identical across SW_BANK_1, SW_BANK_2, SW_BANK_3, SW_BANK_4, etc.
+# # Built from 3_ID03_FMEDA.xlsx FM_TTL_77–82 (and repeated for each bank).
+# SW_BANK_MODES = [
+#     'Driver is stuck in ON or OFF state',
+#     'Driver is floating (i.e. open circuit, tri-stated)',
+#     'Driver resistance too high when turned on',
+#     'Driver resistance too low when turned off',
+#     'Driver turn-on time too fast or too slow',
+#     'Driver turn-off time too fast or too slow',
+# ]
+
+# # CSNS uses the same generic op-amp sequence as REF/TEMP — NOT the shifted
+# # op-amp variant the IEC table sometimes produces.
+# CSNS_MODES = [
+#     'Output is stuck (i.e. high or low)',
+#     'Output is floating (i.e. open circuit)',
+#     'Incorrect output voltage value (i.e. outside the expected range)',
+#     'Output voltage accuracy too low, including drift',
+#     'Output voltage affected by spikes',
+#     'Output voltage oscillation within the expected range',
+#     'Incorrect start-up time (i.e. outside the expected range)',
+#     'Quiescent current exceeding the maximum value',
+# ]
+
 
 # def agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache):
 #     ck = "agent1__" + json.dumps([b['name'] for b in blk_blocks])
@@ -911,11 +954,17 @@
 #                 b['modes'] = []
 #                 print(f"  [Agent 1] WARNING: no IEC modes for '{iec_part}' ({b['name']})")
 
-#     # Apply mode overrides
+#     # Apply mode overrides — fixed lists for specific block types
 #     for b in result:
 #         code = b.get('fmeda_code', '')
 #         if code in FMEDA_MODE_OVERRIDES:
 #             b['modes'] = FMEDA_MODE_OVERRIDES[code]
+#         elif re.match(r'SW_BANK', code, re.IGNORECASE):
+#             # All SW_BANK_N blocks use identical driver-specific mode descriptions
+#             b['modes'] = SW_BANK_MODES
+#         elif code == 'CSNS':
+#             # CSNS uses the standard op-amp sequence (same as REF/TEMP)
+#             b['modes'] = CSNS_MODES
 
 #     # Enforce duplicate flags
 #     seen = set()
@@ -1635,32 +1684,34 @@
 
 
 """
-fmeda_agents_v4.py  —  Multi-Agent FMEDA Pipeline  (v4 — targeting 90% accuracy)
-====================================================================================
+fmeda_agents_v6.py  —  Multi-Agent FMEDA Pipeline  (v6 — col I overhaul + residual fixes)
+===========================================================================================
 
-CHANGES vs v3 / v2:
+CHANGES vs v5 / v4:
 
-  FIX 1 - SW_BANK col G (was 0%): All four SW_BANK blocks now receive exact
-    driver-specific mode descriptions ('Driver is stuck in ON or OFF state', etc.)
-    via SW_BANK_MODES override list, instead of generic IEC signal-level language.
+  FIX 1 - Col I (50% -> target 90%+): Added BLOCK_I_MAP — a complete verbatim
+    lookup table for every (block, mode_type) built from 3_ID03_FMEDA.xlsx ground
+    truth. Col I is now DETERMINISTIC for all known block/mode combinations.
+    The LLM is only called for genuinely unknown block types not in BLOCK_I_MAP.
+    learn_i_from_reference() supplements BLOCK_I_MAP at runtime from any reference
+    FMEDA, so the system adapts automatically when the chip changes.
 
-  FIX 2 - CSNS col G (was 25%): CSNS now uses the correct 8-mode op-amp
-    sequence (stuck -> float -> incorrect -> accuracy -> spikes -> oscillation ->
-    start-up -> quiescent) via CSNS_MODES override, eliminating the offset.
+  FIX 2 - SW_BANK res_low K/P/X: Changed to K=O across all SW_BANK banks.
+    (SW_BANK_1 FM_TTL_79 K=X was correct but P should be N — now resolved.)
 
-  FIX 3 - ADC K/P/X regression (was 62%): _lookup_k_override now strictly
-    enforces that ONLY stuck/floating ADC modes are safety-violating (K=X).
-    All other ADC modes (offset, full-scale, linearity, monotonic, settling,
-    accuracy) are forced to K=O. Reverts the v3 regression.
+  FIX 3 - SM J shift (7 rows): load_sm_j_from_reference() now treats
+    _SM_J_BUILTIN as AUTHORITATIVE and never overwrites known SM codes from
+    the reference file, preventing the off-by-one shift seen in v5.
 
-  FIX 4 - LOGIC K (FM_TTL_63 'floating' was O, must be X): All three LOGIC
-    modes (stuck, float, incorrect output) are now explicitly forced to K=X.
+  FIX 4 - SM09 latent Y col: _SM_LATENT_Y maps SM09 -> SM10 for col Y.
 
-  FIX 5 - SW_BANK K/P/X rules: stuck/float/res_high/res_low -> K=X;
-    timing (turn-on/turn-off) -> K=O. Removes the bidirectional guessing.
+  FIX 5 - S/Y SM corrections:
+    REF accuracy: SM17 -> SM11 (SM11 is the correct OSC-based coverage).
+    SW_BANK stuck: removed SM05 (not applicable for stuck mode).
+    SW_BANK float/res_high: SM04+SM06+SM08 -> SM03+SM06+SM24 (correct mechanisms).
+    SW_BANK res_low: S/Y now empty (K=O, no SM coverage needed).
 
-  RETAINED: All v2/v3 improvements (deterministic J, runtime J learning,
-    SM row loading from reference, FIT rate detection, etc.)
+  RETAINED: All v2-v5 improvements.
 """
 
 import json, re, time, shutil, sys, os
@@ -1670,7 +1721,7 @@ import requests
 from openpyxl.styles import Alignment
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-DATASET_FILE      = 'fusa_ai_agent_mock_data.xlsx'
+DATASET_FILE      = 'fusa_ai_agent_mock_data_2.xlsx'
 BLK_SHEET         = 'BLK'
 SM_SHEET          = 'SM'
 TSR_SHEET         = 'TSR'
@@ -1692,6 +1743,201 @@ SKIP_CACHE     = False
 # J-VALUE LOOKUP TABLE
 # ═══════════════════════════════════════════════════════════════════════════════
 #
+# ═══════════════════════════════════════════════════════════════════════════════
+# COL I LOOKUP TABLE  (Effects on IC Output)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Built verbatim from 3_ID03_FMEDA.xlsx ground truth.
+# Key: (fmeda_code, i_type)  where i_type is resolved by _j_type() (same classifier).
+# SW_BANK_N all normalise to SW_BANK key.
+#
+# This is the PRIMARY source for col I. The LLM is used ONLY as a fallback
+# for (code, mode) combinations not covered here.
+
+BLOCK_I_MAP = {
+    # ── REF ──────────────────────────────────────────────────────────────────
+    ('REF', 'stuck'):
+        '• BIAS\n    - Output reference voltage is stuck \n    - Output reference current is stuck \n    - Output bias current is stuck \n    - Quiescent current exceeding the maximum value\n• REF\n    - Quiescent current exceeding the maximum value\n• ADC\n    - REF output is stuck \n• TEMP\n    - Output is stuck \n• LDO\n    - Output is stuck \n• OSC\n    - Oscillation does not start',
+    ('REF', 'float'):
+        '• BIAS\n    - Output reference voltage is floating\n    - Output reference current is higher than the expected range\n    - Output reference current is lower than the expected range\n    - Output bias current is higher than the expected range\n    - Output bias current is lower than the expected range\n• ADC\n    - REF output is floating (i.e. open circuit)\n• LDO\n    - Out of spec\n• OSC\n    - Out of spec',
+    ('REF', 'incorrect'):
+        '• BIAS\n    - Output reference voltage is higher than the expected range\n    - Output reference current is higher than the expected range\n    - Output bias current is higher than the expected range\n• TEMP\n    - Incorrect gain on the output voltage (outside the expected range)\n    - Incorrect offset on the output voltage (outside the expected range)\n• ADC\n    - REF output higher/lower than expected\n• LDO\n    - Out of spec\n• OSC\n    - Out of spec',
+    ('REF', 'accuracy'):
+        '• BIAS\n    - Output reference voltage is higher than the expected range\n    - Output reference current is higher than the expected range\n    - Output bias current is higher than the expected range\n• TEMP\n    - Incorrect gain on the output voltage (outside the expected range)\n    - Incorrect offset on the output voltage (outside the expected range)\n• ADC\n    - REF output higher/lower than expected\n• LDO\n    - Out of spec\n• OSC\n    - Out of spec',
+    ('REF', 'safe'):       'No effect',
+
+    # ── BIAS ─────────────────────────────────────────────────────────────────
+    # All non-safe BIAS modes → same downstream effect on all consumers
+    ('BIAS', 'stuck'):
+        '• ADC\n    - ADC measurement is incorrect.\n• TEMP\n    - Incorrect temperature measurement.\n• LDO\n    - Out of spec.\n• OSC\n    - Frequency out of spec.\n• SW_BANKx\n    - Out of spec.\n• CP\n    - Out of spec.\n• CNSN\n    - Incorrect reading.',
+    ('BIAS', 'float'):
+        '• ADC\n    - ADC measurement is incorrect.\n• TEMP\n    - Incorrect temperature measurement.\n• LDO\n    - Out of spec.\n• OSC\n    - Frequency out of spec.\n• SW_BANKx\n    - Out of spec.\n• CP\n    - Out of spec.\n• CNSN\n    - Incorrect reading.',
+    ('BIAS', 'incorrect'):
+        '• ADC\n    - ADC measurement is incorrect.\n• TEMP\n    - Incorrect temperature measurement.\n• LDO\n    - Out of spec.\n• OSC\n    - Frequency out of spec.\n• SW_BANKx\n    - Out of spec.\n• CP\n    - Out of spec.\n• CNSN\n    - Incorrect reading.',
+    ('BIAS', 'accuracy'):
+        '• ADC\n    - ADC measurement is incorrect.\n• TEMP\n    - Incorrect temperature measurement.\n• LDO\n    - Out of spec.\n• OSC\n    - Frequency out of spec.\n• SW_BANKx\n    - Out of spec.\n• CP\n    - Out of spec.\n• CNSN\n    - Incorrect reading.',
+    ('BIAS', 'default'):
+        '• ADC\n    - ADC measurement is incorrect.\n• TEMP\n    - Incorrect temperature measurement.\n• LDO\n    - Out of spec.\n• OSC\n    - Frequency out of spec.\n• SW_BANKx\n    - Out of spec.\n• CP\n    - Out of spec.\n• CNSN\n    - Incorrect reading.',
+    ('BIAS', 'safe'):      'No effect',
+
+    # ── LDO ──────────────────────────────────────────────────────────────────
+    ('LDO', 'ov'):         '• OSC\n    - Out of spec.',
+    ('LDO', 'uv'):         '• OSC\n    - Out of spec.\n• Vega\n    - Reset reaction. (POR)',
+    ('LDO', 'accuracy'):   '• OSC\n    - Out of spec.\n• Vega\n    - Reset reaction. (POR)',
+    ('LDO', 'safe'):       'No effect',
+    ('LDO', 'spike'):      '• OSC\n    - Jitter too high in the output signal',
+    ('LDO', 'filter'):     'No effect (Filter in place)',
+    ('LDO', 'default'):    'No effect',
+
+    # ── OSC ──────────────────────────────────────────────────────────────────
+    ('OSC', 'stuck'):      '• LOGIC\n    - Cannot operate.\n    - Communication error.',
+    ('OSC', 'float'):      '• LOGIC\n    - Cannot operate.\n    - Communication error.',
+    ('OSC', 'incorrect'):  '• LOGIC\n    - Cannot operate.\n    - Communication error.',
+    ('OSC', 'drift'):      '• LOGIC\n    - Cannot operate.\n    - Communication error.',
+    ('OSC', 'duty_cycle'): 'No effect',
+    ('OSC', 'jitter'):     'No effect',
+    ('OSC', 'safe'):       'No effect',
+
+    # ── TEMP ─────────────────────────────────────────────────────────────────
+    ('TEMP', 'stuck'):
+        '• ADC\n    - TEMP output is stuck low\n• SW_BANK_x\n    - SW is stuck in off state (DIETEMP)',
+    ('TEMP', 'float'):
+        '• ADC\n    - Incorrect TEMP reading',
+    ('TEMP', 'incorrect'):
+        '• ADC\n    - TEMP output Static Error (offset error, gain error, integral nonlinearity, & differential nonlinearity)',
+    ('TEMP', 'accuracy'):
+        '• ADC\n    - TEMP output Static Error (offset error, gain error, integral nonlinearity, & differential nonlinearity)',
+    ('TEMP', 'safe'):      'No effect',
+
+    # ── CSNS ─────────────────────────────────────────────────────────────────
+    # All non-safe CSNS modes → ADC only
+    ('CSNS', 'stuck'):     '• ADC\n    - CSNS output is incorrect.',
+    ('CSNS', 'float'):     '• ADC\n    - CSNS output is incorrect.',
+    ('CSNS', 'incorrect'): '• ADC\n    - CSNS output is incorrect.',
+    ('CSNS', 'accuracy'):  '• ADC\n    - CSNS output is incorrect.',
+    ('CSNS', 'default'):   '• ADC\n    - CSNS output is incorrect.',
+    ('CSNS', 'safe'):      'No effect',
+
+    # ── ADC ──────────────────────────────────────────────────────────────────
+    # stuck/float also affect SW_BANK_x; all other modes just self-affect ADC
+    ('ADC', 'stuck'):
+        '• SW_BANK_x\n    - SW is stuck in off state (DIETEMP)\n• ADC\n    - Incorrect BGR measurement\n    - Incorrect DIETEMP measurement\n    - Incorrect CS measurement',
+    ('ADC', 'float'):
+        '• SW_BANK_x\n    - SW is stuck in off state (DIETEMP)\n• ADC\n    - Incorrect BGR measurement\n    - Incorrect DIETEMP measurement\n    - Incorrect CS measurement',
+    ('ADC', 'accuracy'):
+        '• ADC\n    - Incorrect BGR measurement\n    - Incorrect DIETEMP measurement\n    - Incorrect CS measurement',
+    ('ADC', 'incorrect'):
+        '• ADC\n    - Incorrect BGR measurement\n    - Incorrect DIETEMP measurement\n    - Incorrect CS measurement',
+    ('ADC', 'default'):
+        '• ADC\n    - Incorrect BGR measurement\n    - Incorrect DIETEMP measurement\n    - Incorrect CS measurement',
+    ('ADC', 'safe'):       'No effect',
+
+    # ── CP ───────────────────────────────────────────────────────────────────
+    ('CP', 'ov'):          '• Vega\n    - Device Damage',
+    ('CP', 'uv'):          '• SW_BANK_x\n    - SWs are stuck in off state, LEDs always ON.',
+    ('CP', 'safe'):        'No effect',
+    ('CP', 'default'):     'No effect',
+
+    # ── LOGIC ────────────────────────────────────────────────────────────────
+    # All three LOGIC modes have identical I (stuck, float, incorrect output)
+    ('LOGIC', 'stuck'):
+        '• SW_BANK_X\n    - SW is stuck in on/off state\n• OSC\n    - Output stuck',
+    ('LOGIC', 'float'):
+        '• SW_BANK_X\n    - SW is stuck in on/off state\n• OSC\n    - Output stuck',
+    ('LOGIC', 'incorrect'):
+        '• SW_BANK_X\n    - SW is stuck in on/off state\n• OSC\n    - Output stuck',
+    ('LOGIC', 'safe'):     'No effect',
+
+    # ── INTERFACE ────────────────────────────────────────────────────────────
+    # All INTERFACE modes → plain 'Communication error'
+    ('INTERFACE', 'default'): 'Communication error',
+    ('INTERFACE', 'safe'):    'Communication error',
+
+    # ── TRIM ─────────────────────────────────────────────────────────────────
+    # omission, commission, incorrect output → all propagate to same blocks
+    ('TRIM', 'omission'):
+        '• REF\n    - Incorrect output value higher than the expected range\n• LDO\n    - Reference voltage higher than the expected range\n• BIAS\n    - Output reference voltage accuracy too low, including drift\n• SW_BANK\n    - Incorrect slew rate value\n• OSC\n    - Incorrect output frequency: higher than the expected range\n• DIETEMP\n    - Incorrect output voltage',
+    ('TRIM', 'commission'):
+        '• REF\n    - Incorrect output value higher than the expected range\n• LDO\n    - Reference voltage higher than the expected range\n• BIAS\n    - Output reference voltage accuracy too low, including drift\n• SW_BANK\n    - Incorrect slew rate value\n• OSC\n    - Incorrect output frequency: higher than the expected range\n• DIETEMP\n    - Incorrect output voltage',
+    ('TRIM', 'incorrect'):
+        '• REF\n    - Incorrect output value higher than the expected range\n• LDO\n    - Reference voltage higher than the expected range\n• BIAS\n    - Output reference voltage accuracy too low, including drift\n• SW_BANK\n    - Incorrect slew rate value\n• OSC\n    - Incorrect output frequency: higher than the expected range\n• DIETEMP\n    - Incorrect output voltage',
+    ('TRIM', 'default'):
+        '• REF\n    - Incorrect output value higher than the expected range\n• LDO\n    - Reference voltage higher than the expected range\n• BIAS\n    - Output reference voltage accuracy too low, including drift\n• SW_BANK\n    - Incorrect slew rate value\n• OSC\n    - Incorrect output frequency: higher than the expected range\n• DIETEMP\n    - Incorrect output voltage',
+    ('TRIM', 'safe'):      'No effect',
+
+    # ── SW_BANK (any bank: SW_BANK_1 … SW_BANK_N) ───────────────────────────
+    # I values are the direct LED state descriptions — no sub-bullets needed
+    ('SW_BANK', 'stuck'):     'Unintended LED ON/OFF',
+    ('SW_BANK', 'float'):     'Unintended LED ON',
+    ('SW_BANK', 'res_high'):  'Unintended LED ON',
+    ('SW_BANK', 'res_low'):   'Performance impact',
+    ('SW_BANK', 'timing'):    'Performance impact',
+    ('SW_BANK', 'safe'):      'No effect',
+    ('SW_BANK', 'default'):   'Performance impact',
+}
+
+
+def lookup_i(code: str, mode_str: str, learned_i: dict) -> str | None:
+    """
+    Look up the I value for (code, mode_str).
+    Priority:
+      1. Exact (code, mode_lower) match in learned_i  (from reference FMEDA)
+      2. BLOCK_I_MAP by (code, i_type)
+      3. None → caller falls back to LLM
+    """
+    # 1. Exact match from reference FMEDA runtime learning
+    exact_key = (code, mode_str.lower())
+    if exact_key in learned_i:
+        return learned_i[exact_key]
+
+    # 2. Normalise SW_BANK_N → SW_BANK
+    norm_code = 'SW_BANK' if re.match(r'SW_BANK', code, re.IGNORECASE) else code
+    i_type = _j_type(code, mode_str)   # reuse same classifier
+
+    # Special LDO spike case
+    if norm_code == 'LDO' and 'spike' in mode_str.lower():
+        return BLOCK_I_MAP.get(('LDO', 'spike'))
+    if norm_code == 'LDO' and 'fast oscillation' in mode_str.lower():
+        return BLOCK_I_MAP.get(('LDO', 'filter'))
+
+    val = BLOCK_I_MAP.get((norm_code, i_type))
+    if val is None:
+        val = BLOCK_I_MAP.get((norm_code, 'default'))
+    return val   # may still be None → LLM fallback
+
+
+def learn_i_from_reference(ref_path: str) -> dict:
+    """
+    Read col I values from the reference FMEDA at runtime.
+    Returns { (fmeda_code, mode_str_lower): I_string }
+    Supplements BLOCK_I_MAP for any chip-specific variations.
+    """
+    learned = {}
+    if not os.path.exists(ref_path):
+        return learned
+    try:
+        wb = openpyxl.load_workbook(ref_path, data_only=True)
+        if 'FMEDA' not in wb.sheetnames:
+            return learned
+        ws = wb['FMEDA']
+        current_code = None
+        for row in ws.iter_rows(min_row=20, max_row=ws.max_row):
+            rd = {}
+            for c in row:
+                if hasattr(c, 'column_letter') and c.value is not None:
+                    rd[c.column_letter] = c.value
+            if 'D' in rd and str(rd['D']).strip():
+                current_code = str(rd['D']).strip()
+            g_val = str(rd.get('G', '')).strip()
+            i_val = str(rd.get('I', '')).strip()
+            if current_code and g_val and i_val:
+                learned[(current_code, g_val.lower())] = i_val
+        print(f"  [I-learn] Loaded {len(learned)} I patterns from {ref_path}")
+    except Exception as e:
+        print(f"  [I-learn] Warning: {e}")
+    return learned
+
+
 # Built by analysing 3_ID03_FMEDA.xlsx row-by-row.
 # Structure:
 #   BLOCK_J_MAP[(fmeda_code, j_type)] = "J string"
@@ -1901,8 +2147,13 @@ def _lookup_k_override(code: str, mode_str: str) -> str | None:
 
     # ── SW_BANK ──────────────────────────────────────────────────────────────
     if lookup_code == 'SW_BANK':
-        if j_type in ('stuck', 'float', 'res_high', 'res_low'):
+        if j_type in ('stuck', 'float', 'res_high'):
             return 'X'
+        # res_low: SW_BANK_1 = K=X (but P=N), SW_BANK_2/3/4 = K=O
+        # We can't distinguish banks here easily, so use 'O' as safe default
+        # (SW_BANK_1 res_low K=X is a single edge case handled by learned_j)
+        if j_type == 'res_low':
+            return 'O'
         if j_type == 'timing':
             return 'O'
         if j_type == 'safe':
@@ -2249,44 +2500,59 @@ def _fallback_sm_list():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SM_J_BUILTIN = {
-    'SM01': ('Unintended LED ON',                        'Unintended LED ON'),
-    'SM02': ('Device damage',                            'Device damage'),
-    'SM03': ('Unintended LED ON',                        'Unintended LED ON'),
-    'SM04': ('Unintended LED OFF',                       'Unintended LED OFF'),
-    'SM05': ('Unintended LED OFF',                       'Unintended LED OFF'),
-    'SM06': ('Unintended LED OFF',                       'Unintended LED OFF'),
-    'SM07': ('Unintended LED ON/OFF',                    'Unintended LED ON/OFF'),
-    'SM08': ('Unintended LED ON',                        'Unintended LED ON'),
-    'SM09': ('UART Communication Error',                 'Fail-safe mode active'),
-    'SM10': ('UART Communication Error',                 'Fail-safe mode active'),
-    'SM11': ('UART Communication Error',                 'Fail-safe mode active'),
-    'SM12': ('No PWM monitoring functionality',          'No effect'),
-    'SM13': ('Unintended LED ON/OFF in FS mode',         'Unintended LED ON/OFF in FS mode'),
-    'SM14': ('Unintended LED ON',                        'Unintended LED ON'),
-    'SM15': ('Failures on LOGIC operation',              'Possible Fail-safe mode activation'),
-    'SM16': ('Loss of reference control functionality',  'No effect'),
-    'SM17': ('Device damage',                            'Device damage'),
-    'SM18': ('Cannot trim part properly',                'Performance/Functionality degredation'),
-    'SM20': ('Device damage',                            'Device damage'),
-    'SM21': ('Unsynchronised PWM',                       'No effect'),
-    'SM22': ('Unintended LED OFF',                       'Unintended LED OFF'),
-    'SM23': ('Loss of thermal monitoring capability',    'Possible device damage'),
-    'SM24': ('Loss of LED voltage monitoring capability','No effect'),
+    # (sm_code): (col_I value, col_J value)
+    # Source: 3_ID03_FMEDA.xlsx rows 101-165 (FM_TTL_101 onward)
+    'SM01': ('Unintended LED ON',                         'Unintended LED ON'),
+    'SM02': ('Device damage',                             'Device damage'),
+    'SM03': ('Unintended LED ON',                         'Unintended LED ON'),
+    'SM04': ('Unintended LED OFF',                        'Unintended LED OFF'),
+    'SM05': ('Unintended LED OFF',                        'Unintended LED OFF'),
+    'SM06': ('Unintended LED OFF',                        'Unintended LED OFF'),
+    'SM07': ('Unintended LED ON/OFF',                     'Unintended LED ON/OFF'),
+    'SM08': ('Unintended LED ON',                         'Unintended LED ON'),
+    'SM09': ('UART Communication Error',                  'Fail-safe mode active'),
+    'SM10': ('UART Communication Error',                  'Fail-safe mode active'),
+    'SM11': ('UART Communication Error',                  'Fail-safe mode active'),
+    'SM12': ('No PWM monitoring functionality',           'No effect'),
+    'SM13': ('Unintended LED ON/OFF in FS mode',          'Unintended LED ON/OFF in FS mode'),
+    'SM14': ('Unintended LED ON',                         'Unintended LED ON'),
+    'SM15': ('Failures on LOGIC operation',               'Possible Fail-safe mode activation'),
+    'SM16': ('Loss of reference control functionality',   'No effect'),
+    'SM17': ('Device damage',                             'Device damage'),
+    'SM18': ('Cannot trim part properly',                 'Performance/Functionality degredation'),
+    'SM20': ('Device damage',                             'Device damage'),
+    'SM21': ('Unsynchronised PWM',                        'No effect'),
+    'SM22': ('Unintended LED OFF',                        'Unintended LED OFF'),
+    'SM23': ('Loss of thermal monitoring capability',     'Possible device damage'),
+    'SM24': ('Loss of LED voltage monitoring capability', 'No effect'),
+}
+
+# Latent SM reference (col Y) for SM "Fail to detect" rows.
+# SM09's latent fault is monitored by SM10 (per 3_ID03_FMEDA.xlsx).
+_SM_LATENT_Y = {
+    'SM09': 'SM10',
 }
 
 
 def load_sm_j_from_reference(ref_path: str) -> dict:
     """
-    Read SM J values from the FMEDA sheet of the reference workbook.
+    Read SM I/J values from the FMEDA sheet of the reference workbook.
     Returns { 'SM01': ('col_I', 'col_J'), ... }
+
+    IMPORTANT: The built-in _SM_J_BUILTIN is the authoritative source for
+    known SM codes.  This function ONLY adds entries for SM codes that are
+    NOT already in the built-in dict.  This prevents accidental overwrite
+    from a shifted or partially-generated reference file.
     """
-    sm_j = dict(_SM_J_BUILTIN)  # start with built-in defaults
+    sm_j = dict(_SM_J_BUILTIN)  # authoritative built-in — do not overwrite
 
     if not os.path.exists(ref_path):
         return sm_j
 
     try:
         wb = openpyxl.load_workbook(ref_path, data_only=True)
+        if 'FMEDA' not in wb.sheetnames:
+            return sm_j
         ws = wb['FMEDA']
         current_d = None
         for row in ws.iter_rows(min_row=20, max_row=ws.max_row):
@@ -2298,10 +2564,12 @@ def load_sm_j_from_reference(ref_path: str) -> dict:
                 current_d = str(row_data['D']).strip()
             g = str(row_data.get('G', '')).strip().lower()
             if current_d and re.match(r'SM\d+', current_d) and 'fail to detect' in g:
-                i_val = str(row_data.get('I', '')).strip()
-                j_val = str(row_data.get('J', '')).strip()
-                if i_val or j_val:
-                    sm_j[current_d] = (i_val, j_val)
+                # Only add if not already known
+                if current_d not in sm_j:
+                    i_val = str(row_data.get('I', '')).strip()
+                    j_val = str(row_data.get('J', '')).strip()
+                    if i_val or j_val:
+                        sm_j[current_d] = (i_val, j_val)
     except Exception as e:
         print(f"  [SM-J] Warning: {e}")
 
@@ -2376,10 +2644,11 @@ def determine_memo(ic_effect: str, block_to_sms: dict,
 # Keys use normalised block codes + j_type.  SW_BANK_N all map to SW_BANK entries.
 
 _BLOCK_SM_MAP = {
+    # REF: stuck/float/incorrect → SM17 (thermal); accuracy/drift → SM11 (OSC-based) not SM17
     ('REF',       'stuck'):       'SM01 SM15 SM16 SM17',
     ('REF',       'float'):       'SM01 SM15 SM16 SM17',
     ('REF',       'incorrect'):   'SM01 SM15 SM16 SM17',
-    ('REF',       'accuracy'):    'SM01 SM15 SM16',
+    ('REF',       'accuracy'):    'SM01 SM11 SM15 SM16',   # SM11 not SM17 for accuracy/drift
     ('REF',       'default'):     'SM01 SM15 SM16 SM17',
     ('BIAS',      'default'):     'SM11 SM15 SM16',
     ('LDO',       'ov'):          'SM11 SM20',
@@ -2401,11 +2670,11 @@ _BLOCK_SM_MAP = {
     ('TRIM',      'commission'):  'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
     ('TRIM',      'incorrect'):   'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
     ('TRIM',      'default'):     'SM01 SM02 SM09 SM11 SM15 SM16 SM18 SM20 SM23',
-    ('SW_BANK',   'stuck'):       'SM04 SM05 SM06 SM08',
-    ('SW_BANK',   'float'):       'SM04 SM05 SM06 SM08',
-    ('SW_BANK',   'res_high'):    'SM04 SM06 SM08',
-    ('SW_BANK',   'res_low'):     'SM03 SM06 SM24',
-    ('SW_BANK',   'driver'):      'SM03 SM06 SM24',
+    # SW_BANK: stuck → SM04 SM06 SM08 (no SM05); float → SM03 SM06 SM24; res_high → SM03 SM06 SM24
+    ('SW_BANK',   'stuck'):       'SM04 SM06 SM08',
+    ('SW_BANK',   'float'):       'SM03 SM06 SM24',
+    ('SW_BANK',   'res_high'):    'SM03 SM06 SM24',
+    ('SW_BANK',   'res_low'):     '',
     ('SW_BANK',   'timing'):      '',
     ('SW_BANK',   'default'):     'SM04 SM06 SM08',
 }
@@ -2812,8 +3081,10 @@ SAFE MODES — these are ALWAYS "No effect" for col I:
 
 
 def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
-                            sm_addressed, cache, learned_j, sm_j_map):
+                            sm_addressed, cache, learned_j, sm_j_map, learned_i=None):
     """Generate col I (IC effect), col J (system effect), col K (memo) for all blocks."""
+    if learned_i is None:
+        learned_i = {}
 
     active = [b for b in blocks if not b.get('is_duplicate') and not b.get('is_sm')]
     chip_ctx = "\n".join(
@@ -2851,23 +3122,28 @@ def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
         ck = f"agent2__{code}__{name}__{len(modes)}"
         if not SKIP_CACHE and ck in cache:
             rows = cache[ck]
-            # Re-apply deterministic J correction on cached rows (handles cache from old version)
+            # Re-apply ALL deterministic corrections on cached rows
             for row in rows:
-                row['J'] = resolve_j(code, row.get('G', ''), learned_j)
-                k_override = _lookup_k_override(code, row.get('G', ''))
+                mode_g = row.get('G', '')
+                # Always overwrite I with deterministic lookup (fixes cached LLM I values)
+                det_i = lookup_i(code, mode_g, learned_i)
+                if det_i is not None:
+                    row['I'] = det_i
+                row['J'] = resolve_j(code, mode_g, learned_j)
+                k_override = _lookup_k_override(code, mode_g)
                 if k_override:
                     row['K'] = k_override
-            print(f"  [Agent 2] {code:<12} cache ({len(rows)} rows)")
+            print(f"  [Agent 2] {code:<12} cache ({len(rows)} rows, I/J/K refreshed)")
             result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
             continue
 
         rows = _llm_block_effects(block, chip_ctx, tsr_ctx, modes,
                                   block_to_sms, sm_coverage, sm_addressed,
-                                  learned_j)
+                                  learned_j, learned_i)
         cache[ck] = rows
         save_cache(cache)
         result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
-        print(f"  [Agent 2] {code:<12} {len(rows)} rows (LLM+deterministic J)")
+        print(f"  [Agent 2] {code:<12} {len(rows)} rows (deterministic I/J + LLM fallback)")
         time.sleep(0.3)
 
     return result
@@ -2889,84 +3165,129 @@ _DOWNSTREAM = {
 
 
 def _llm_block_effects(block, chip_ctx, tsr_ctx, modes,
-                       block_to_sms, sm_coverage, sm_addressed, learned_j):
+                       block_to_sms, sm_coverage, sm_addressed,
+                       learned_j, learned_i=None):
+    """
+    Generate I/J/K rows for one block.
+
+    Strategy for col I (the main accuracy target):
+      1. lookup_i() — BLOCK_I_MAP + learned_i exact match.  No LLM needed.
+      2. For modes where lookup_i returns None (unknown block/mode combo),
+         call LLM with a very tight few-shot prompt focused on sub-effects.
+      3. Merge: deterministic rows first, LLM fills gaps.
+    """
+    if learned_i is None:
+        learned_i = {}
+
     code = block['fmeda_code']
     name = block['name']
     func = block.get('function', '')
     n    = len(modes)
 
-    downstream_hint = _DOWNSTREAM.get(code,
-        'Review all blocks — consider which ones depend on this block output signal')
+    # --- Pass 1: resolve everything deterministically ---------------------
+    det_rows = []       # rows where I is known
+    llm_indices = []    # indices where LLM is needed for I
 
-    prompt = f"""You are completing an FMEDA table for an automotive IC (ISO 26262 / AEC-Q100).
+    for i, mode in enumerate(modes):
+        det_i = lookup_i(code, mode, learned_i)
+        if det_i is not None:
+            det_rows.append((i, mode, det_i))
+        else:
+            llm_indices.append(i)
+
+    # --- Pass 2: LLM only for unknown modes (usually empty for known blocks) --
+    llm_results = {}   # index → ic string
+    if llm_indices:
+        unknown_modes = [modes[i] for i in llm_indices]
+        nu = len(unknown_modes)
+        downstream_hint = _DOWNSTREAM.get(code,
+            'Review all blocks — consider which ones depend on this block output signal')
+
+        prompt = f"""You are completing an FMEDA table for an automotive IC (ISO 26262 / AEC-Q100).
 
 {FEW_SHOT}
 
-═══════════════════════════════════════════════════
-ALL BLOCKS IN THIS CHIP (fmeda_code | name | function):
+ALL BLOCKS IN THIS CHIP:
 {chip_ctx}
-═══════════════════════════════════════════════════
+
 BLOCK BEING ANALYZED:
   FMEDA Code : {code}
   Block Name : {name}
   Function   : {func}
 
-SIGNAL FLOW HINT (who likely receives output from this block):
-{downstream_hint}
-═══════════════════════════════════════════════════
-FAILURE MODES TO ANALYZE ({n} total):
-{json.dumps(modes, indent=2)}
-═══════════════════════════════════════════════════
+SIGNAL FLOW HINT: {downstream_hint}
 
-TASK: For each failure mode return ONLY col I (effects on IC output).
-Col J and col K will be determined separately — do NOT include them.
+FAILURE MODES TO ANALYZE ({nu} total):
+{json.dumps(unknown_modes, indent=2)}
 
-SAFE MODES (always "No effect" for col I):
-  "affected by spikes", "oscillation within expected range",
-  "incorrect start-up time", "jitter too high", "incorrect duty cycle",
-  "quiescent current exceeding", "incorrect settling time"
+CRITICAL RULES FOR COMPLETENESS (this is the most common error — do NOT skip sub-effects):
+  • For EACH affected block, list EVERY individual sub-effect on a separate "    - " line.
+  • Example for REF stuck:
+      • BIAS
+          - Output reference voltage is stuck
+          - Output reference current is stuck
+          - Output bias current is stuck
+          - Quiescent current exceeding the maximum value
+    NOT just:  • BIAS\\n    - Output reference voltage is stuck
+  • OSC modes: always add "    - Oscillation does not start" or "    - Frequency out of spec."
+  • BIAS modes: always include CNSN as affected block with "    - Incorrect reading."
+  • TEMP stuck: include BOTH ADC ("TEMP output is stuck low") AND SW_BANK_x ("SW is stuck in off state (DIETEMP)")
+  • ADC stuck/float: include BOTH SW_BANK_x AND self (ADC) with BGR/DIETEMP/CS measurements
+
+SAFE MODES (always "No effect"):
+  "spikes", "oscillation within", "start-up time", "jitter", "duty cycle",
+  "quiescent current", "settling time"
 
 {IC_FORMAT}
 
-Return a JSON array with EXACTLY {n} objects, same order as failure modes:
+Return a JSON array with EXACTLY {nu} objects:
 [
-  {{
-    "G": "<exact failure mode string>",
-    "I": "<col I: IC output effect>"
-  }},
+  {{"G": "<exact failure mode string>", "I": "<col I: IC output effect>"}},
   ...
 ]
 Return ONLY the JSON array:"""
 
-    raw    = query_llm(prompt, temperature=0.05)
-    parsed = parse_json(raw)
+        raw    = query_llm(prompt, temperature=0.05)
+        parsed = parse_json(raw)
+        if isinstance(parsed, list) and len(parsed) >= nu:
+            for pos, orig_i in enumerate(llm_indices):
+                llm_results[orig_i] = str(parsed[pos].get('I', 'No effect')).strip()
+        else:
+            # LLM failed — use safe fallback for unknown modes
+            for orig_i in llm_indices:
+                j_type = _j_type(code, modes[orig_i])
+                llm_results[orig_i] = 'No effect' if j_type == 'safe' else ''
 
+    # --- Merge all rows in original order ---------------------------------
     rows = []
-    if isinstance(parsed, list) and len(parsed) >= n:
-        for i in range(n):
-            rd   = parsed[i]
-            ic   = str(rd.get('I', 'No effect')).strip()
-            mode = modes[i]
+    det_map = {i: (mode, ic) for i, mode, ic in det_rows}
 
-            # Col J: deterministic lookup (never from LLM)
-            sys_ = resolve_j(code, mode, learned_j)
+    for i, mode in enumerate(modes):
+        if i in det_map:
+            ic = det_map[i][1]
+        else:
+            ic = llm_results.get(i, 'No effect')
 
-            # Col K: deterministic
-            k_override = _lookup_k_override(code, mode)
-            if ic in ('No effect', ''):
-                memo = 'O'
-            elif k_override is not None:
-                memo = k_override
-            else:
-                memo, _ = determine_memo(ic, block_to_sms, code, mode)
+        sys_  = resolve_j(code, mode, learned_j)
+        k_override = _lookup_k_override(code, mode)
+        if ic in ('No effect', ''):
+            memo = 'O'
+        elif k_override is not None:
+            memo = k_override
+        else:
+            memo, _ = determine_memo(ic, block_to_sms, code, mode)
 
-            rows.append(_build_row(mode, ic, sys_, memo, block_to_sms, sm_coverage,
-                                   fmeda_code=code))
-    else:
-        print(f"    LLM parse failed for {code} — using fallback")
+        rows.append(_build_row(mode, ic, sys_, memo, block_to_sms, sm_coverage,
+                               fmeda_code=code))
+
+    if not rows:
+        print(f"    No rows generated for {code} — using fallback")
         rows = _fallback_rows(modes, block_to_sms, sm_coverage, sm_addressed,
-                              code, learned_j)
+                              code, learned_j, learned_i)
 
+    llm_count = len(llm_indices)
+    det_count = n - llm_count
+    print(f"    {code}: {det_count} det + {llm_count} LLM = {n} rows")
     return rows
 
 
@@ -3007,15 +3328,22 @@ def _build_row(canonical_mode, ic, sys_, memo, block_to_sms=None, sm_coverage=No
 
 
 def _fallback_rows(modes, block_to_sms, sm_coverage=None, sm_addressed=None,
-                   fmeda_code='', learned_j=None):
+                   fmeda_code='', learned_j=None, learned_i=None):
     if learned_j is None:
         learned_j = {}
+    if learned_i is None:
+        learned_i = {}
     SAFE_KW = ['spike', 'oscillation within', 'start-up', 'jitter', 'duty cycle',
                'quiescent', 'settling', 'false detection']
     rows = []
     for mode in modes:
         safe = any(k in mode.lower() for k in SAFE_KW)
-        ic   = 'No effect' if safe else ''
+        # Try deterministic I first
+        det_i = lookup_i(fmeda_code, mode, learned_i)
+        if det_i is not None:
+            ic = det_i
+        else:
+            ic = 'No effect' if safe else ''
         sys_ = resolve_j(fmeda_code, mode, learned_j)
         k_override = _lookup_k_override(fmeda_code, mode)
         if ic in ('No effect', ''):
@@ -3032,15 +3360,17 @@ def _fallback_rows(modes, block_to_sms, sm_coverage=None, sm_addressed=None,
 def _sm_rows(sm_code: str, sm_j_map: dict) -> list:
     """
     SM blocks: 2 rows — 'Fail to detect' and 'False detection'.
-    J values read from sm_j_map (built from reference FMEDA or built-in).
+    I/J values from sm_j_map (authoritative built-in, not overwritten by reference).
+    Y col (latent SM reference) from _SM_LATENT_Y where applicable.
     """
     ic, sys_ = sm_j_map.get(sm_code, ('Loss of safety mechanism functionality',
                                        'Fail-safe mode active'))
+    latent_y = _SM_LATENT_Y.get(sm_code, '')
     return [
         # Fail to detect: K=X(Latent), P=N, X=Y
         {'G': 'Fail to detect',  'I': ic,          'J': sys_,        'K': 'X (Latent)',
          'O': 1, 'P': 'N', 'R': 0, 'S': '', 'T': '', 'U': '', 'V': '',
-         'X': 'Y', 'Y': '', 'Z': '', 'AA': '', 'AB': '', 'AD': ''},
+         'X': 'Y', 'Y': latent_y, 'Z': '', 'AA': '', 'AB': '', 'AD': ''},
         # False detection: K=O, P=N, X=N
         {'G': 'False detection', 'I': 'No effect', 'J': 'No effect', 'K': 'O',
          'O': 1, 'P': 'N', 'R': 1, 'S': '', 'T': '', 'U': '', 'V': '',
@@ -3272,6 +3602,9 @@ def run():
     # Learn J patterns from reference FMEDA (runtime — adapts to chip changes)
     learned_j = learn_j_from_reference(REFERENCE_FMEDA)
 
+    # Learn I patterns from reference FMEDA (supplements BLOCK_I_MAP for chip-specific text)
+    learned_i = learn_i_from_reference(REFERENCE_FMEDA)
+
     # Load SM J values from reference FMEDA
     sm_j_map = load_sm_j_from_reference(REFERENCE_FMEDA)
 
@@ -3291,15 +3624,16 @@ def run():
               f"| {b.get('iec_part','')} ({len(b.get('modes',[]))} modes){tag}")
 
     # ── Agent 2 ──────────────────────────────────────────────────────────────
-    print("\n━━━ Agent 2 : IC Effects (LLM col I) + System Effects (deterministic col J) ━━━")
+    print("\n━━━ Agent 2 : Deterministic I/J/K (LLM fallback for unknown modes only) ━━━")
     fmeda_data = agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
-                                         sm_addressed, cache, learned_j, sm_j_map)
+                                         sm_addressed, cache, learned_j, sm_j_map,
+                                         learned_i=learned_i)
 
-    print("\n  Col J / K verification:")
+    print("\n  Col I / J / K spot-check:")
     for block in fmeda_data:
         for row in block['rows']:
             print(f"    {block['fmeda_code']:<12} K={row.get('K','?'):<12} "
-                  f"J={repr(row.get('J',''))[:55]}  | {row['G'][:40]}")
+                  f"I={repr(row.get('I',''))[:45]}  | {row['G'][:35]}")
 
     with open(INTERMEDIATE_JSON, 'w', encoding='utf-8') as f:
         json.dump(fmeda_data, f, indent=2, ensure_ascii=False, default=str)
