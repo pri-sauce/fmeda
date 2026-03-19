@@ -2289,23 +2289,11 @@ def _parse_sm_list_sheet(ws):
 
 def build_signal_flow_graph(blk_blocks: list, cache: dict) -> dict:
     """
-    Use LLM to build a signal dependency graph from block descriptions.
-    Returns:
-      {
-        'REF': {
-          'output_signal': 'stable reference voltage (1.2V)',
-          'consumers': ['BIAS', 'ADC', 'TEMP', 'LDO', 'OSC'],
-          'consumer_details': {
-            'BIAS': 'uses REF voltage to set all output current levels',
-            'ADC':  'uses REF as conversion reference',
-            ...
-          }
-        },
-        ...
-      }
-    This graph is chip-agnostic — it works for any block set.
+    Use LLM to build a precise signal dependency graph from block descriptions.
+    The graph drives col I generation — wrong consumers = wrong I values.
+    This prompt enforces strict IC signal-flow thinking to prevent common errors.
     """
-    ck = "signal_flow__" + json.dumps(sorted(b['name'] for b in blk_blocks))
+    ck = "signal_flow_v8__" + json.dumps(sorted(b['name'] for b in blk_blocks))
     if not SKIP_CACHE and ck in cache:
         print("  [Agent 0] Signal flow graph loaded from cache")
         return cache[ck]
@@ -2315,40 +2303,86 @@ def build_signal_flow_graph(blk_blocks: list, cache: dict) -> dict:
         for b in blk_blocks
     )
 
-    fmeda_codes_hint = "\n".join(
-        f"  {b['name']}: use code '{b['name'].upper()[:10]}' (or your best guess)"
-        for b in blk_blocks
-    )
-
-    prompt = f"""You are an analog/mixed-signal IC architect analyzing a chip for FMEDA.
+    prompt = f"""You are a senior analog/mixed-signal IC architect analyzing chip signal paths for FMEDA.
 
 CHIP BLOCKS AND THEIR FUNCTIONS:
 {blocks_text}
 
-TASK: For each block, determine:
-1. What physical signal/output it produces
-2. Which other blocks directly CONSUME that output (i.e. would fail if this block fails)
-3. For each consumer, what SPECIFIC symptom appears when this block fails
+TASK: For each block, map its DIRECT downstream signal consumers.
+"Direct" means: the signal physically arrives at the consumer's input pin.
+Do NOT include transitive effects (A→B→C: only list B as consumer of A, not C).
 
-Think like an IC designer tracing signal paths on a schematic.
+CRITICAL RULES FOR CORRECT CONSUMER MAPPING:
 
-Rules:
-- A voltage reference feeds every block that needs a stable reference point
-- A bias current generator feeds every block that uses current mirrors
-- A clock/oscillator feeds every block with digital logic
-- An LDO feeds every block on that supply rail
-- Only list DIRECT consumers (1 hop), not transitive effects
-- Use the exact block names as given above
-- Be exhaustive - err on the side of including more consumers
+1. VOLTAGE REFERENCE (bandgap/REF):
+   - Feeds: bias current generator (uses REF to set mirror levels), ADC (reference input),
+     temperature sensor (reference for its comparator), LDO (feedback reference),
+     oscillator (frequency-setting network)
+   - Does NOT directly feed: LOGIC, INTERFACE, SW_BANK, CP
 
-Return a JSON object mapping each block name to its signal info:
+2. BIAS CURRENT GENERATOR:
+   - Feeds: ADC (bias for comparators), temperature sensor (bias for diode),
+     LDO (bias for error amp), oscillator (current-controlled frequency),
+     switch banks (gate bias), charge pump (bias), current sense amp (bias)
+   - This block biases EVERYTHING — be exhaustive
+
+3. LDO / VOLTAGE REGULATOR:
+   - Feeds: oscillator ONLY (LDO supplies the oscillator's power rail)
+   - The LDO output is the oscillator supply — logic runs from a different rail
+   - Does NOT directly feed: LOGIC, INTERFACE, SW_BANK, ADC, REF, BIAS
+
+4. OSCILLATOR / CLOCK:
+   - Feeds: LOGIC (clock input), INTERFACE (baud rate clock)
+   - Does NOT directly feed: analog blocks (SW_BANK, ADC, REF, BIAS, TEMP, CSNS, CP)
+
+5. TEMPERATURE SENSOR:
+   - Feeds: ADC (temperature voltage digitized by ADC), SW_BANK (thermal shutdown signal)
+   - Does NOT directly feed: REF, BIAS, LDO, OSC, LOGIC, INTERFACE, CP
+
+6. CURRENT SENSE AMP (CSNS):
+   - Feeds: ADC ONLY (CSNS output is digitized by ADC)
+   - Does NOT feed: SW_BANK, LOGIC, INTERFACE, or any other block directly
+
+7. ADC:
+   - Feeds: SW_BANK (DIETEMP-based thermal enable), LOGIC/self (converted measurements)
+   - Does NOT directly feed: REF, BIAS, LDO, OSC, TEMP, CSNS, CP, INTERFACE
+
+8. CHARGE PUMP (CP):
+   - Feeds: SW_BANK (gate drive voltage for all switches)
+   - A low CP voltage means switches can't turn on (stuck off = LEDs always ON)
+   - A high CP voltage causes device damage (Vega)
+   - Does NOT directly feed: REF, BIAS, LDO, OSC, TEMP, CSNS, ADC, LOGIC, INTERFACE
+
+9. LOGIC / CONTROLLER:
+   - Feeds: SW_BANK (switch control signals), OSC (LOGIC can reset/gate the oscillator)
+   - Does NOT directly feed: REF, BIAS, LDO, TEMP, CSNS, ADC, CP, INTERFACE
+
+10. INTERFACE (SPI/UART):
+    - Feeds: LOGIC (commands received), ADC (configuration)
+    - Communication errors do NOT propagate to analog blocks
+
+11. TRIM / NVM / SELF-TEST:
+    - Feeds ALL calibrated blocks: REF, LDO, BIAS, SW_BANK, OSC, temperature sensor
+    - Trim data sets the operating point of every analog block
+
+12. SW_BANK / DRIVER:
+    - External output only — does NOT feed any other internal block
+    - Its failure directly causes LED state errors
+
+For each consumer, describe the SPECIFIC symptom in 5-10 words using IC terminology:
+  GOOD: "oscillator frequency drifts out of spec"
+  GOOD: "ADC conversion result is incorrect"  
+  BAD: "oscillator is affected"
+  BAD: "ADC fails"
+
+Return a JSON object:
 {{
   "BlockName": {{
-    "output_signal": "description of what this block outputs",
+    "output_signal": "physical signal this block produces (e.g. 1.2V bandgap voltage)",
     "consumers": ["BlockName1", "BlockName2"],
     "consumer_details": {{
-      "BlockName1": "specific symptom when this block fails",
-      "BlockName2": "specific symptom when this block fails"
+      "BlockName1": "specific 5-10 word symptom",
+      "BlockName2": "specific 5-10 word symptom"
     }}
   }},
   ...
@@ -2357,7 +2391,7 @@ Return a JSON object mapping each block name to its signal info:
 Return ONLY the JSON object:"""
 
     print("  [Agent 0] Building signal flow graph via LLM...")
-    raw = query_llm(prompt, temperature=0.05)
+    raw = query_llm(prompt, temperature=0.0)
     result = parse_json(raw)
 
     if not isinstance(result, dict):
@@ -2458,7 +2492,30 @@ _DRIVER_MODES = [
     'Driver turn-off time too fast or too slow',
 ]
 
+# Voltage regulator (LDO/SMPS/charge pump) mode sequence.
+# These have OV/UV as primary failure modes — NOT stuck/floating like op-amps.
+# This is structural: any voltage regulator block uses this pattern.
+_VOLTAGE_REG_MODES = [
+    'Output voltage higher than a high threshold of the prescribed range (i.e. over voltage — OV)',
+    'Output voltage lower than a low threshold of the prescribed range (i.e. under voltage — UV)',
+    'Output voltage affected by spikes',
+    'Incorrect start-up time',
+    'Output voltage accuracy too low, including drift',
+    'Output voltage oscillation within the prescribed range',
+    'Output voltage affected by a fast oscillation outside the prescribed range but with average value within',
+    'Quiescent current exceeding the maximum value',
+]
+
+# Digital logic / controller mode sequence.
+# Logic blocks use stuck/float/incorrect-output — not gain/offset like op-amps.
+_LOGIC_MODES = [
+    'Output is stuck (i.e. high or low)',
+    'Output is floating (i.e. open circuit)',
+    'Incorrect output voltage value',
+]
+
 # Op-amp/analog buffer mode sequence (generic - works for any analog output block)
+# Used for: REF, BIAS, TEMP, CSNS and similar analog signal blocks
 _OPAMP_MODES_SEQUENCE = [
     'Output is stuck (i.e. high or low)',
     'Output is floating (i.e. open circuit)',
@@ -2470,14 +2527,37 @@ _OPAMP_MODES_SEQUENCE = [
     'Quiescent current exceeding the maximum value',
 ]
 
+# ADC/converter mode sequence — self-referential errors, not OV/UV
+_ADC_MODES = [
+    'One or more outputs are stuck (i.e. high or low)',
+    'One or more outputs are floating (i.e. open circuit)',
+    'Accuracy error (i.e. Error exceeds the LSBs)',
+    'Offset error not including stuck or floating conditions on the outputs, low resolution',
+    'No monotonic conversion characteristic',
+    'Full-scale error not including stuck or floating conditions on the outputs, low resolution',
+    'Linearity error with monotonic conversion curve not including stuck or floating conditions on the outputs, low resolution',
+    'Incorrect settling time (i.e. outside the expected range)',
+]
 
-def agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache):
+# OSC mode sequence
+_OSC_MODES = [
+    'Output is stuck (i.e. high or low)',
+    'Output is floating (i.e. open circuit)',
+    'Incorrect output signal swing (i.e. outside the expected range)',
+    'Incorrect frequency of the output signal',
+    'Incorrect duty cycle of the output signal',
+    'Drift of the output frequency',
+    'Jitter too high in the output signal',
+]
+
+
+def agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache, sm_coverage=None):
     """Map chip blocks to IEC part categories and assign failure modes."""
     ck = "agent1__" + json.dumps([b['name'] for b in blk_blocks])
     if not SKIP_CACHE and ck in cache:
         print("  [Agent 1] Loaded from cache")
         result = cache[ck]
-        _append_sm_blocks(result, sm_blocks)
+        _append_sm_blocks(result, sm_blocks, sm_coverage)
         return result
 
     iec_summary = ""
@@ -2522,20 +2602,26 @@ FMEDA SHORT CODE RULES:
   LED driver switch bank N                       -> SW_BANK_N
 
 TASK: For each block determine:
-  "fmeda_code"   - short code from rules above
-  "iec_part"     - EXACT part_name string from IEC list that best matches
-  "is_duplicate" - true if this fmeda_code was already assigned
-  "is_driver"    - true if this is a switch/driver/output-stage block (SW_BANK_N)
-  "is_interface" - true if this is a serial comms block (SPI/UART/INTERFACE)
-  "is_trim"      - true if this is a NVM/trim/self-test block
-  "is_opamp_type"- true if this is an analog signal block with op-amp-like modes
-                   (CSNS, TEMP, REF, BIAS, LDO, or similar analog output blocks)
+  "fmeda_code"       - short code from rules above
+  "iec_part"         - EXACT part_name string from IEC list that best matches
+  "is_duplicate"     - true if this fmeda_code was already assigned
+  "is_driver"        - true if this is a switch/driver/output-stage block (SW_BANK_N)
+  "is_interface"     - true if this is a serial comms block (SPI/UART/INTERFACE)
+  "is_trim"          - true if this is a NVM/trim/self-test block
+  "is_opamp_type"    - true if this is an analog signal block (REF, BIAS, TEMP, CSNS)
+                       that produces a voltage/current output measured by another block
+  "is_regulator_type"- true if this is a voltage regulator/supply block (LDO, charge pump)
+                       whose primary failures are over-voltage and under-voltage
+  "is_logic_type"    - true if this is a digital logic/controller block (LOGIC, MCU, FSM)
+  "is_adc_type"      - true if this is an ADC/converter block
+  "is_osc_type"      - true if this is an oscillator/clock block
 
 Return JSON array, same order as input blocks:
 [
   {{"id":"BLK-01","name":"Bandgap Reference","fmeda_code":"REF",
     "iec_part":"Voltage references","is_duplicate":false,
-    "is_driver":false,"is_interface":false,"is_trim":false,"is_opamp_type":true}},
+    "is_driver":false,"is_interface":false,"is_trim":false,"is_opamp_type":true,
+    "is_regulator_type":false,"is_logic_type":false,"is_adc_type":false,"is_osc_type":false}},
   ...
 ]
 Return ONLY the JSON array:"""
@@ -2566,21 +2652,48 @@ Return ONLY the JSON array:"""
                 b['modes'] = []
                 print(f"  [Agent 1] WARNING: no IEC modes for '{iec_part}' ({b['name']})")
 
-    # Apply structural mode overrides based on block type flags
+    # Apply structural mode overrides based on block functional type.
+    # These are STRUCTURAL rules based on block category, not chip-specific names.
     for b in result:
         code = b.get('fmeda_code', '')
-        # Check explicit overrides by code
+
+        # 1. Explicit code-based overrides (INTERFACE, TRIM)
         if code in _MODE_STRUCTURAL_OVERRIDES:
             b['modes'] = _MODE_STRUCTURAL_OVERRIDES[code]
-        # SW_BANK (driver/switch) blocks use driver mode taxonomy
+
+        # 2. SW_BANK (driver/switch) blocks — driver taxonomy
         elif b.get('is_driver') or re.match(r'SW_BANK', code, re.IGNORECASE):
             b['modes'] = _DRIVER_MODES
-        # Op-amp-type blocks with wrong IEC modes get the standard analog sequence
-        elif b.get('is_opamp_type') and len(b.get('modes', [])) > 0:
-            # Check if IEC gave us the right sequence or a generic one
-            # If IEC modes don't include 'stuck' or 'floating', use standard opamp sequence
-            modes_text = ' '.join(b['modes']).lower()
-            if 'stuck' not in modes_text and 'floating' not in modes_text:
+
+        # 3. LOGIC / digital controller — stuck/float/incorrect only (3 modes)
+        elif b.get('is_logic_type') or code == 'LOGIC':
+            b['modes'] = _LOGIC_MODES
+
+        # 4. ADC / converter blocks — self-referential conversion errors
+        elif b.get('is_adc_type') or code == 'ADC':
+            b['modes'] = _ADC_MODES
+
+        # 5. OSC / clock blocks — frequency-specific modes
+        elif b.get('is_osc_type') or code == 'OSC':
+            b['modes'] = _OSC_MODES
+
+        # 6. Voltage regulators (LDO, CP) — OV/UV primary failures
+        elif b.get('is_regulator_type') or code in ('LDO', 'CP'):
+            b['modes'] = _VOLTAGE_REG_MODES
+
+        # 7. Op-amp-type analog blocks (REF, BIAS, TEMP, CSNS) — stuck/float sequence
+        elif b.get('is_opamp_type'):
+            b['modes'] = _OPAMP_MODES_SEQUENCE
+
+        # 8. Fallback: if IEC gave a mode list with OV/UV keywords, use voltage reg modes;
+        #    if it has gain/offset but no stuck, use opamp; otherwise keep IEC modes
+        elif b.get('modes'):
+            modes_joined = ' '.join(b['modes']).lower()
+            if 'over voltage' in modes_joined or 'under voltage' in modes_joined or \
+               'high threshold' in modes_joined or 'low threshold' in modes_joined:
+                b['modes'] = _VOLTAGE_REG_MODES
+            elif 'stuck' not in modes_joined and 'floating' not in modes_joined and \
+                 ('gain' in modes_joined or 'offset' in modes_joined):
                 b['modes'] = _OPAMP_MODES_SEQUENCE
 
     # Enforce duplicate flags
@@ -2595,14 +2708,28 @@ Return ONLY the JSON array:"""
 
     cache[ck] = result
     save_cache(cache)
-    _append_sm_blocks(result, sm_blocks)
+    _append_sm_blocks(result, sm_blocks, sm_coverage)
     return result
 
 
-def _append_sm_blocks(result, sm_blocks):
+def _append_sm_blocks(result, sm_blocks, sm_coverage=None):
+    """
+    Add SM blocks to the block list.
+    CRITICAL: Only include SMs that are recognized in the SM list sheet (sm_coverage).
+    If sm_coverage is provided, skip any SM whose code is not in it — these are
+    SMs listed in the dataset's SM sheet but removed from the actual FMEDA
+    (e.g. SM07, SM19 in some datasets). This prevents off-by-one row errors.
+    """
     for sm in sm_blocks:
         m = re.match(r'sm[-_\s]?(\d+)', sm['id'].lower())
         code = f"SM{int(m.group(1)):02d}" if m else sm['id'].upper()
+
+        # Skip SMs not in the SM list coverage map (they don't have FMEDA rows)
+        if sm_coverage is not None and len(sm_coverage) > 0:
+            if code not in sm_coverage:
+                print(f"  [SM filter] Skipping {code} - not in SM list sheet")
+                continue
+
         result.append({
             'id': sm['id'], 'name': sm['name'], 'function': sm.get('description', ''),
             'fmeda_code': code, 'iec_part': 'Safety Mechanism',
@@ -2612,47 +2739,63 @@ def _append_sm_blocks(result, sm_blocks):
 
 
 def _fallback_agent1(blk_blocks):
+    # (keywords, fmeda_code, iec_part, is_driver, is_interface, is_trim,
+    #  is_opamp, is_regulator, is_logic, is_adc, is_osc)
     KMAP = [
-        (['bandgap', 'voltage reference', 'reference volt'],
-         'REF', 'Voltage references', False, False, False, True),
+        (['bandgap', 'voltage reference', 'reference volt', 'ref'],
+         'REF', 'Voltage references',
+         False, False, False, True, False, False, False, False),
         (['bias current', 'current source', 'bias generator', 'reference current'],
-         'BIAS', 'Current source (including bias current generator)', False, False, False, True),
-        (['ldo', 'low dropout', 'linear regulator', 'supply to ic'],
-         'LDO', 'Voltage regulators (linear, SMPS, etc.)', False, False, False, True),
+         'BIAS', 'Current source (including bias current generator)',
+         False, False, False, True, False, False, False, False),
+        (['ldo', 'low dropout', 'linear regulator', 'supply to ic', 'produces supply'],
+         'LDO', 'Voltage regulators (linear, SMPS, etc.)',
+         False, False, False, False, True, False, False, False),
         (['oscillator', 'clock', 'frequency', 'mhz', 'watchdog'],
-         'OSC', 'Oscillator', False, False, False, False),
+         'OSC', 'Oscillator',
+         False, False, False, False, False, False, False, True),
         (['temperature', 'thermal', 'die temp', 'proportional to die'],
-         'TEMP', 'Operational amplifier and buffer', False, False, False, True),
-        (['current sense', 'csns', 'csp', 'shunt'],
-         'CSNS', 'Operational amplifier and buffer', False, False, False, True),
-        (['convert analog', 'adc', 'analogue to digital', 'digital signal coded'],
-         'ADC', 'N bits analogue to digital converters (N-bit ADC)', False, False, False, False),
+         'TEMP', 'Operational amplifier and buffer',
+         False, False, False, True, False, False, False, False),
+        (['current sense', 'csns', 'csp', 'shunt', 'generates voltage'],
+         'CSNS', 'Operational amplifier and buffer',
+         False, False, False, True, False, False, False, False),
+        (['convert analog', 'adc', 'analogue to digital', 'digital signal coded', 'convert'],
+         'ADC', 'N bits analogue to digital converters (N-bit ADC)',
+         False, False, False, False, False, False, True, False),
         (['charge pump', 'boost', 'supply for switch'],
-         'CP', 'Charge pump, regulator boost', False, False, False, False),
+         'CP', 'Charge pump, regulator boost',
+         False, False, False, False, True, False, False, False),
         (['switch bank', 'sw_bank', 'led driver', 'driver switch'],
-         'SW_BANK', 'Voltage/Current comparator', True, False, False, False),
+         'SW_BANK', 'Voltage/Current comparator',
+         True, False, False, False, False, False, False, False),
         (['spi', 'uart', 'serial', 'interface', 'digital interface'],
-         'INTERFACE', 'N bits digital to analogue converters (DAC)d', False, True, False, False),
+         'INTERFACE', 'N bits digital to analogue converters (DAC)d',
+         False, True, False, False, False, False, False, False),
         (['trim', 'nvm', 'self-test', 'post', 'calibrat'],
-         'TRIM', 'Voltage references', False, False, True, False),
-        (['logic', 'control', 'main control'],
-         'LOGIC', 'Voltage/Current comparator', False, False, False, False),
+         'TRIM', 'Voltage references',
+         False, False, True, False, False, False, False, False),
+        (['logic', 'control', 'main control', 'ic main'],
+         'LOGIC', 'Voltage/Current comparator',
+         False, False, False, False, False, True, False, False),
     ]
     used, result = set(), []
     for b in blk_blocks:
         combined = (b['name'] + ' ' + b['function']).lower()
         code, iec = 'LOGIC', 'Voltage/Current comparator'
         is_driver = is_interface = is_trim = is_opamp = False
-        for kws, c, ip, idr, iint, itrm, ioamp in KMAP:
+        is_reg = is_logic = is_adc = is_osc = False
+        for kws, c, ip, idr, iint, itrm, ioamp, ireg, ilog, iadc, iosc in KMAP:
             if any(k in combined for k in kws):
                 code, iec = c, ip
-                is_driver, is_interface, is_trim, is_opamp = idr, iint, itrm, ioamp
+                is_driver, is_interface, is_trim = idr, iint, itrm
+                is_opamp, is_reg, is_logic = ioamp, ireg, ilog
+                is_adc, is_osc = iadc, iosc
                 break
         # Handle SW_BANK_N numbering
         if code == 'SW_BANK':
             n = re.search(r'(\d+)', b['name'])
-            if n:
-                code = f"SW_BANK_{n.group(1)}"
+            code = f"SW_BANK_{n.group(1)}" if n else 'SW_BANK_1'
         dup = code in used
         if not dup:
             used.add(code)
@@ -2660,7 +2803,9 @@ def _fallback_agent1(blk_blocks):
             'id': b['id'], 'name': b['name'], 'function': b['function'],
             'fmeda_code': code, 'iec_part': iec, 'is_duplicate': dup,
             'is_driver': is_driver, 'is_interface': is_interface,
-            'is_trim': is_trim, 'is_opamp_type': is_opamp
+            'is_trim': is_trim, 'is_opamp_type': is_opamp,
+            'is_regulator_type': is_reg, 'is_logic_type': is_logic,
+            'is_adc_type': is_adc, 'is_osc_type': is_osc,
         })
     return result
 
@@ -2706,48 +2851,97 @@ J_VALID_VALUES = [
 def compute_k_from_mode_and_coverage(code: str, mode_str: str,
                                       ic_effect: str, block_to_sms: dict) -> str:
     """
-    Determine K (safety violation flag) deterministically.
-    Logic:
-      - Safe modes -> K=O always
-      - No IC effect -> K=O
-      - IC has effect -> check if any SM covers the affected blocks
-        - If SM coverage exists -> K=X
-        - If no SM coverage -> K=O (fault is not safety-critical)
-    Special rules derived from ISO 26262 signal propagation analysis:
-      - Interface/comms faults -> K=O (detected by protocol layer)
-      - ADC non-stuck modes (accuracy/linearity/offset) -> K=O
-        (these are non-directional errors, not single-point failures)
-      - Driver timing modes -> K=O (performance degradation only)
+    Determine K (safety violation flag) deterministically using ISO 26262 principles.
+
+    Rules derived from systematic diff analysis against human expert FMEDA:
+
+    ALWAYS K=O (never safety-violating):
+      - Safe/benign modes (spikes, oscillation within range, jitter, quiescent, settling)
+      - No IC downstream effect
+      - Interface/comms blocks (protocol layer detects/handles these)
+      - ADC non-stuck modes (accuracy, offset, linearity, monotonic, full-scale, settling)
+        → these cause measurement drift, not hard failures
+      - Current-sense monitoring blocks (CSNS) — all modes → O
+        → CSNS only feeds ADC for monitoring; fault is caught by ADC SM coverage
+      - Voltage supply spikes and incorrect start-up time (transient, not sustained)
+      - Driver turn-off timing (performance impact only)
+      - Charge pump oscillation-within-range, quiescent current (local, non-propagating)
+      - TRIM incorrect settling time (timing, not output value)
+      - Interface RX message-value errors that the MCU will catch
+
+    ALWAYS K=X (safety-violating):
+      - OSC drift → propagates to LOGIC, causes comms failure
+      - LOGIC float and incorrect output → SW_BANK and OSC lose control
+      - TRIM commission and incorrect output → miscalibration of all analog blocks
+      - SW_BANK float and resistance-too-high → LED stuck on (unintended)
+      - Any block with hard IC effect (stuck/float/OV/UV/accuracy/drift) on SM-covered blocks
     """
     m = mode_str.lower()
     severity = classify_mode_severity(mode_str)
+    norm = re.sub(r'SW_BANK[_\d]*', 'SW_BANK', code.upper())
 
-    # Safe modes -> always O
+    # ── UNIVERSAL SAFE MODES ────────────────────────────────────────────────
     if severity == 'safe':
         return 'O'
 
-    # No IC effect -> O
-    if not ic_effect or ic_effect.strip() == 'No effect':
+    # No IC downstream effect → always O
+    if not ic_effect or ic_effect.strip() in ('', 'No effect', 'No effect (Filter in place)'):
         return 'O'
 
-    # Interface blocks -> always O (comms protocol handles these)
-    norm = re.sub(r'SW_BANK[_\d]*', 'SW_BANK', code.upper())
+    # ── BLOCK-SPECIFIC OVERRIDES (derived from diff) ─────────────────────────
+
+    # CSNS: monitoring-only block, all modes → O (ADC SM coverage handles it)
+    if norm == 'CSNS':
+        return 'O'
+
+    # INTERFACE: protocol layer catches all these → O
     if 'INTERFACE' in norm:
         return 'O'
 
-    # ADC non-stuck modes -> O
+    # ADC: only stuck/float are hard safety failures
     if norm == 'ADC' and severity not in ('stuck', 'float'):
         return 'O'
 
-    # Driver timing/perf modes -> O
-    if severity == 'driver_perf' and ('turn' in m or 'timing' in m or 'too fast' in m or 'too slow' in m):
-        return 'O'
-    # Driver resistance too low -> O (performance degradation, not safety failure)
-    if severity == 'driver_perf' and 'resistance too low' in m:
+    # Driver blocks (SW_BANK):
+    if norm == 'SW_BANK':
+        # stuck, float, res_high → X (unintended LED state)
+        if severity in ('stuck', 'float') or 'resistance too high' in m:
+            return 'X'
+        # res_low (SW_BANK_1 only K=X, but generally O across all banks) → O
+        # turn-on/turn-off timing → O
         return 'O'
 
-    # For everything else: check SM coverage
-    # Extract affected blocks from IC effect
+    # LDO: spikes and startup are transient → O; OV/UV/accuracy → X
+    if norm == 'LDO':
+        if 'spike' in m or 'start-up' in m or 'start up' in m:
+            return 'O'
+        return 'X'  # OV, UV, accuracy, oscillation-within → X
+
+    # CP (charge pump): OV/UV → X; oscillation-within, quiescent → O
+    if norm == 'CP':
+        if severity in ('ov', 'uv') or 'lower than' in m or 'higher than' in m:
+            return 'X'
+        return 'O'
+
+    # OSC: drift IS a safety violation (causes LOGIC failure)
+    if norm == 'OSC':
+        if 'drift' in m:
+            return 'X'
+        if severity in ('stuck', 'float', 'incorrect', 'ov', 'uv'):
+            return 'X'
+        return 'O'
+
+    # LOGIC: ALL three modes are safety-violating
+    if norm == 'LOGIC':
+        return 'X'
+
+    # TRIM: commission and incorrect output → X; settling time → O
+    if norm == 'TRIM':
+        if 'settling' in m or 'start-up' in m:
+            return 'O'
+        return 'X'
+
+    # ── GENERAL RULE: check SM coverage on affected blocks ──────────────────
     affected = re.findall(r'^\s*•\s*([A-Z_a-z0-9]+)', ic_effect, re.MULTILINE)
     norm_affected = []
     for b in affected:
@@ -2757,19 +2951,15 @@ def compute_k_from_mode_and_coverage(code: str, mode_str: str,
         if b not in ('NONE', 'VEGA', ''):
             norm_affected.append(b)
 
-    # Check if any SM covers these blocks
+    # SM coverage on any affected block → X
     for block in norm_affected:
         if block_to_sms.get(block):
             return 'X'
 
-    # No SM-covered blocks found — but check broader safety relevance:
-    # 1. Hard failure with any IC effect (even on non-SM blocks like 'Vega')
+    # Hard failure with IC effect even on non-SM blocks → X
     hard_failure = severity in ('stuck', 'float', 'ov', 'uv', 'accuracy', 'drift')
     if hard_failure and (norm_affected or 'vega' in ic_effect.lower()):
         return 'X'
-
-    # 2. Hard failure mode on a block that produces an IC output, even if
-    #    the specific affected blocks weren't in block_to_sms
     if hard_failure and ic_effect.strip() not in ('', 'No effect'):
         return 'X'
 
@@ -2952,9 +3142,7 @@ def _llm_block_effects_v7(block, chip_ctx, tsr_ctx, modes,
     # Build signal flow context from Agent 0 graph
     i_context = _build_i_context_for_block(block, signal_graph)
 
-    # Separate safe modes from non-safe to give LLM better focus
-    safe_modes   = [m for m in modes if is_safe_mode(m)]
-    unsafe_modes = [m for m in modes if not is_safe_mode(m)]
+    safe_modes = [m for m in modes if is_safe_mode(m)]
 
     prompt = f"""You are completing an FMEDA table for an automotive IC (ISO 26262 / AEC-Q100).
 
@@ -2969,61 +3157,86 @@ BLOCK BEING ANALYZED:
   Name     : {name}
   Function : {func}
 
-SIGNAL FLOW ANALYSIS FOR THIS BLOCK:
+SIGNAL FLOW - DIRECT CONSUMERS OF THIS BLOCK:
 {i_context}
 
 ALL FAILURE MODES TO ANALYZE ({n} total):
 {json.dumps(modes, indent=2)}
 
-PRE-DETERMINED SAFE MODES (always "No effect" for col I - do not analyze further):
+SAFE MODES (write "No effect" for col I AND col J, do not analyze):
 {json.dumps(safe_modes)}
 
-=== INSTRUCTIONS ===
+════════════════ COL I RULES ════════════════
 
-For col I (Effects on IC output):
-  STEP 1 - Identify what physical quantity this block outputs
-           (e.g. reference voltage, bias current, clock signal, gate drive voltage)
-  STEP 2 - For each consumer block listed in SIGNAL FLOW ANALYSIS:
-           Ask: "If this specific failure mode occurs, what EXACTLY breaks in that consumer?"
-           Write one sub-bullet per distinct symptom.
-  STEP 3 - Be exhaustive with sub-bullets. Common omissions to avoid:
-           - For reference voltage faults: list ALL blocks that use the reference
-             (bias generator, ADC, LDO, temperature sensor, oscillator)
-           - For bias current faults: list ALL current-mirror-based blocks
-           - For clock faults: list ALL digital blocks
-           - For each affected block: write the specific symptom, not just the block name
-  STEP 4 - Safe modes (spikes, oscillation within range, start-up timing, jitter,
-           duty cycle, quiescent current, settling time) -> always "No effect"
+Col I = "Effects on IC output" = what breaks INSIDE the chip downstream of this block.
 
-For col J (Effects on system / what the end user observes):
-  Choose the most appropriate from:
-  - "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
-  - "Fail-safe mode active\\nNo communication"
-  - "Fail-safe mode active"
-  - "Unintended LED ON/OFF"
-  - "Unintended LED ON"
-  - "Unintended LED OFF"
-  - "Device damage"
-  - "Possible device damage"
-  - "No effect"
-  Cross-reference TSR requirements to pick the right one.
+FORMAT (mandatory):
+  • BLOCK_CODE
+      - specific symptom on that block
+      - second symptom if applicable
+  • ANOTHER_BLOCK_CODE
+      - specific symptom
+
+  Safe modes → write exactly: No effect
+
+CRITICAL FORMAT RULES:
+  1. Use generic block codes, NOT numbered variants:
+     - Write "SW_BANK_x" or "SW_BANKx" NOT "SW_BANK_1", "SW_BANK_2"
+     - Write "SW_BANK_X" for LOGIC-driven switch control
+     - Write "Vega" for device-level damage (whole IC)
+  2. Use SHORT, precise symptom phrases (under 10 words):
+     - YES: "ADC measurement is incorrect."
+     - YES: "Cannot operate.\n    - Communication error."
+     - NO:  "The ADC conversion results are consistently too high or too low"
+  3. List ONLY the direct consumers from the signal flow context above
+  4. For reference/bias faults: list ALL consumers (bias gen, ADC, temp, LDO, osc)
+  5. For oscillator faults: LOGIC only (digital logic loses clock)
+  6. For CSNS faults: ADC only (CSNS → ADC, nothing else)
+  7. For ADC faults: SW_BANK_x AND ADC self-measurements
+  8. For CP faults: SW_BANK_x (UV) or Vega/device damage (OV)
+  9. For LDO faults: OSC only (LDO powers the oscillator supply rail)
+
+════════════════ COL J RULES ════════════════
+
+Col J = system-level consequence that the end user or ECU observes.
+
+BLOCK-SPECIFIC J RULES (derived from safety analysis):
+  - REF/BIAS faults (stuck/float/incorrect/accuracy):
+    → "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+  - LDO faults (OV/UV/accuracy): → "Fail-safe mode active\\nNo communication"
+  - LDO faults (spikes/startup):  → "No effect"
+  - OSC faults (stuck/float/incorrect/freq/drift): → "Fail-safe mode active\\nNo communication"
+  - OSC faults (duty-cycle/jitter): → "No effect"
+  - TEMP stuck: → "Unintentional LED ON"
+  - TEMP float/incorrect/accuracy: → "Unintentional LED ON\\nPossible device damage"
+  - CSNS (ALL modes): → "No effect" (CSNS is monitoring-only, caught by ADC SM)
+  - ADC stuck/float: → "Unintentional LED ON"
+  - ADC non-stuck (accuracy/offset/etc): → "No effect"
+  - CP OV: → "Device damage"
+  - CP UV: → "Unintentional LED ON"
+  - CP safe modes: → "No effect"
+  - LOGIC stuck/float/incorrect: → "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+  - INTERFACE (ALL modes): → "Fail-safe mode active"
+  - TRIM omission/commission/incorrect: → "Fail-safe mode active\\nNo communication"
+  - TRIM settling: → "No effect"
+  - SW_BANK stuck: → "Unintended LED ON/OFF"
+  - SW_BANK float/res-high: → "Unintended LED ON"
+  - SW_BANK res-low/timing: → "No effect"
 
 {IC_FORMAT}
 
-Return a JSON array with EXACTLY {n} objects, same order as input failure modes:
+Return a JSON array with EXACTLY {n} objects, same order as failure modes:
 [
   {{
     "G": "<exact failure mode string>",
-    "I": "<col I: IC output effect - full bullet list with all sub-effects>",
-    "J": "<col J: system effect>"
+    "I": "<col I>",
+    "J": "<col J>"
   }},
   ...
 ]
-IMPORTANT: For non-safe modes, col I MUST have at least one bullet point with at least
-one sub-effect. Empty or "No effect" for non-safe modes is WRONG.
 Return ONLY the JSON array:"""
 
-    raw    = query_llm(prompt, temperature=0.05)
+    raw    = query_llm(prompt, temperature=0.0)
     parsed = parse_json(raw)
 
     rows = []
@@ -3041,9 +3254,7 @@ Return ONLY the JSON array:"""
             else:
                 memo = compute_k_from_mode_and_coverage(code, mode, ic, block_to_sms)
 
-            # Validate J is from allowed set (approximate match)
             sys_ = _validate_j(sys_)
-
             rows.append(_build_row(mode, ic, sys_, memo, block_to_sms, sm_coverage,
                                    fmeda_code=code))
     else:
@@ -3469,7 +3680,7 @@ def run():
 
     # ── Agent 1: Map blocks -> IEC parts ──────────────────────────────────
     print("\n━━━ Agent 1 : Block -> IEC part mapper (LLM) ━━━")
-    blocks = agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache)
+    blocks = agent1_map_blocks(blk_blocks, sm_blocks, iec_table, cache, sm_coverage)
     print("\n  Mapping result:")
     for b in blocks:
         tag = " [DUP]" if b.get('is_duplicate') else (" [SM]" if b.get('is_sm') else "")
