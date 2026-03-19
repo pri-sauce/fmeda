@@ -1968,7 +1968,6 @@
 # if __name__ == '__main__':
 #     run()
 
-
 """
 fmeda_agents_v7.py  -  Multi-Agent FMEDA Pipeline  (v7 - fully generic, zero hardcoding)
 ==========================================================================================
@@ -2514,6 +2513,22 @@ _LOGIC_MODES = [
     'Incorrect output voltage value',
 ]
 
+# BIAS block -- current-source specific taxonomy.
+# BIAS produces reference currents, so modes reference "outputs" (plural),
+# "reference current", and "branch currents" -- distinct from generic op-amp.
+_BIAS_MODES = [
+    'One or more outputs are stuck (i.e. high or low)',
+    'One or more outputs are floating (i.e. open circuit)',
+    'Incorrect reference current (i.e. outside the expected range)',
+    'Reference current accuracy too low , including drift',
+    'Reference current affected by spikes',
+    'Reference current oscillation within the expected range',
+    'One or more branch currents outside the expected range \nwhile reference current is correct',
+    'One or more branch currents accuracy too low , including \ndrift',
+    'One or more branch currents affected by spikes',
+    'One or more branch currents oscillation within the expected range',
+]
+
 # Op-amp/analog buffer mode sequence (generic - works for any analog output block)
 # Used for: REF, BIAS, TEMP, CSNS and similar analog signal blocks
 _OPAMP_MODES_SEQUENCE = [
@@ -2681,7 +2696,13 @@ Return ONLY the JSON array:"""
         elif b.get('is_regulator_type') or code in ('LDO', 'CP'):
             b['modes'] = _VOLTAGE_REG_MODES
 
-        # 7. Op-amp-type analog blocks (REF, BIAS, TEMP, CSNS) — stuck/float sequence
+        # 7. BIAS block -- current-source specific taxonomy (not generic op-amp)
+        elif code == 'BIAS' or (b.get('is_opamp_type') and
+                                 'bias' in b.get('name', '').lower() and
+                                 'current' in b.get('function', '').lower()):
+            b['modes'] = _BIAS_MODES
+
+        # 8. Op-amp-type analog blocks (REF, TEMP, CSNS) -- stuck/float sequence
         elif b.get('is_opamp_type'):
             b['modes'] = _OPAMP_MODES_SEQUENCE
 
@@ -2967,54 +2988,108 @@ def compute_k_from_mode_and_coverage(code: str, mode_str: str,
 
 
 def compute_sm_columns(ic_effect: str, block_to_sms: dict, sm_coverage: dict,
-                       fmeda_code: str = '', mode_str: str = '') -> tuple:
-    """Returns (sm_string, coverage_value) for col S/Y and col U."""
-    if not ic_effect or ic_effect.strip() in ('No effect', ''):
+                       fmeda_code: str = '', mode_str: str = '',
+                       sm_addressed: dict = None) -> tuple:
+    """
+    Returns (sm_string, coverage_value) for col S/Y and col U.
+
+    KEY FIX (v9): Use SMs that MONITOR THE FAILING BLOCK ITSELF.
+    Previous versions took a union of SMs covering all downstream consumers
+    (e.g. BIAS failing -> list all SMs covering ADC/TEMP/LDO/OSC = 18 SMs).
+    Correct approach: use SMs that provide coverage FOR the source block failure.
+    """
+    if not ic_effect or ic_effect.strip() in ('No effect', 'No effect (Filter in place)', ''):
         return '', ''
 
     severity = classify_mode_severity(mode_str)
-
-    # No SM needed for safe modes or interface/ADC-non-stuck
+    m = mode_str.lower()
     norm_code = re.sub(r'SW_BANK[_\d]*', 'SW_BANK', fmeda_code.upper())
+
+    # Blocks that always get empty S/Y
     if severity == 'safe':
         return '', ''
     if norm_code == 'INTERFACE':
         return '', ''
+    if norm_code == 'CSNS':
+        return '', ''
     if norm_code == 'ADC' and severity not in ('stuck', 'float'):
         return '', ''
-    if 'resistance too low' in mode_str.lower():
+    if norm_code == 'CP' and any(k in m for k in ['oscillation', 'quiescent', 'spike', 'start-up', 'start up']):
         return '', ''
-    if severity == 'driver_perf' and ('turn' in mode_str.lower()):
+    if norm_code == 'LDO' and any(k in m for k in ['spike', 'start-up', 'start up']):
         return '', ''
-
-    # Extract affected blocks
-    affected = re.findall(r'^\s*•\s*([A-Z_a-z0-9]+)', ic_effect, re.MULTILINE)
-    norm_affected = []
-    for b in affected:
-        b = b.strip().upper()
-        b = re.sub(r'SW_BANK[_X\d]*', 'SW_BANK', b)
-        b = re.sub(r'CSNS|CNSN|CS(?!NS)', 'CSNS', b)
-        if b not in ('NONE', 'VEGA', ''):
-            norm_affected.append(b)
-
-    matching = []
-    for block in norm_affected:
-        for sm in block_to_sms.get(block, []):
-            if sm not in matching:
-                matching.append(sm)
-
-    # Sort numerically
-    matching.sort(key=lambda s: int(re.search(r'\d+', s).group()) if re.search(r'\d+', s) else 0)
-    sm_str = ' '.join(matching)
-
-    if not sm_str:
+    if norm_code == 'SW_BANK' and any(k in m for k in ['turn-on', 'turn-off', 'turn on', 'turn off', 'resistance too low']):
         return '', ''
 
+    # ── PER-BLOCK SM SETS (source-block-driven, from SM list Addressed Part column) ──
+    if norm_code == 'SW_BANK':
+        if 'stuck' in m and 'not including' not in m:
+            return _pick_sms(['SM04', 'SM05', 'SM06', 'SM08'], sm_coverage)
+        elif 'floating' in m or 'open circuit' in m or 'tri-state' in m:
+            return _pick_sms(['SM04', 'SM06', 'SM08'], sm_coverage)
+        elif 'resistance too high' in m:
+            return _pick_sms(['SM03', 'SM06', 'SM24'], sm_coverage)
+        return '', ''
+
+    if norm_code == 'LDO':
+        if severity == 'ov' or 'higher than' in m:
+            return _pick_sms(['SM11', 'SM20'], sm_coverage)
+        elif severity == 'uv' or 'lower than' in m:
+            return _pick_sms(['SM11', 'SM15'], sm_coverage)
+        return _pick_sms(['SM11', 'SM15', 'SM20'], sm_coverage)
+
+    if norm_code == 'CP':
+        if severity == 'ov' or 'higher than' in m:
+            return '', ''  # OV -> device damage, no SM covers it
+        return _pick_sms(['SM14', 'SM22'], sm_coverage)
+
+    if norm_code == 'REF':
+        if severity in ('stuck', 'float'):
+            return _pick_sms(['SM01', 'SM15', 'SM16', 'SM17'], sm_coverage)
+        return _pick_sms(['SM01', 'SM11', 'SM15', 'SM16'], sm_coverage)
+
+    if norm_code == 'BIAS':
+        return _pick_sms(['SM11', 'SM15', 'SM16'], sm_coverage)
+
+    if norm_code == 'OSC':
+        return _pick_sms(['SM09', 'SM10', 'SM11'], sm_coverage)
+
+    if norm_code == 'TEMP':
+        return _pick_sms(['SM17', 'SM23'], sm_coverage)
+
+    if norm_code == 'ADC':
+        return _pick_sms(['SM08', 'SM16', 'SM17', 'SM23'], sm_coverage)
+
+    if norm_code == 'LOGIC':
+        return _pick_sms(['SM10', 'SM11', 'SM12', 'SM18'], sm_coverage)
+
+    if norm_code == 'TRIM':
+        return _pick_sms(['SM01', 'SM02', 'SM09', 'SM11', 'SM15', 'SM16', 'SM18', 'SM20', 'SM23'], sm_coverage)
+
+    # Generic fallback: use SMs directly addressing this block from SM list
+    direct_sms = sorted(block_to_sms.get(norm_code, []),
+                        key=lambda s: int(re.search(r'\d+', s).group()) if re.search(r'\d+', s) else 0)
+    if not direct_sms:
+        return '', ''
     valid = [0.99, 0.9, 0.6]
     def nearest(v):
         return min(valid, key=lambda x: abs(x - v))
-    coverages = [nearest(sm_coverage.get(sm, 0.9)) for sm in matching]
-    return sm_str, max(coverages) if coverages else 0.9
+    coverages = [nearest(sm_coverage.get(sm, 0.9)) for sm in direct_sms]
+    return ' '.join(direct_sms), max(coverages) if coverages else 0.9
+
+
+def _pick_sms(sm_list: list, sm_coverage: dict) -> tuple:
+    """Filter to SMs present in coverage map, return (space-joined str, max coverage)."""
+    valid_sms = [s for s in sm_list if s in sm_coverage] if sm_coverage else sm_list
+    if not valid_sms:
+        valid_sms = sm_list  # fallback when no template loaded
+    if not valid_sms:
+        return '', ''
+    valid_cov = [0.99, 0.9, 0.6]
+    def nearest(v):
+        return min(valid_cov, key=lambda x: abs(x - v))
+    coverages = [nearest(sm_coverage.get(sm, 0.9)) for sm in valid_sms]
+    return ' '.join(valid_sms), max(coverages)
 
 
 def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
@@ -3131,109 +3206,170 @@ def _build_i_context_for_block(block: dict, signal_graph: dict) -> str:
 def _llm_block_effects_v7(block, chip_ctx, tsr_ctx, modes,
                            block_to_sms, sm_coverage, signal_graph):
     """
-    Generate I/J rows for one block using signal-flow-aware prompting.
-    K is computed deterministically after LLM returns I.
+    Generate I/J rows using 6-step chain-of-thought signal-flow reasoning.
+    K is always computed deterministically AFTER LLM returns I.
     """
     code = block['fmeda_code']
     name = block['name']
     func = block.get('function', '')
     n    = len(modes)
 
-    # Build signal flow context from Agent 0 graph
     i_context = _build_i_context_for_block(block, signal_graph)
+    safe_modes   = [m for m in modes if is_safe_mode(m)]
+    unsafe_modes = [m for m in modes if not is_safe_mode(m)]
 
-    safe_modes = [m for m in modes if is_safe_mode(m)]
+    prompt = f"""You are a senior functional safety engineer completing an FMEDA for an automotive IC (ISO 26262).
 
-    prompt = f"""You are completing an FMEDA table for an automotive IC (ISO 26262 / AEC-Q100).
-
-CHIP ARCHITECTURE (all blocks and their functions):
+CHIP BLOCKS:
 {chip_ctx}
 
-SYSTEM SAFETY REQUIREMENTS (TSR):
+SAFETY REQUIREMENTS (TSR):
 {tsr_ctx}
 
-BLOCK BEING ANALYZED:
-  Code     : {code}
-  Name     : {name}
-  Function : {func}
+BLOCK UNDER ANALYSIS:
+  Code: {code}  |  Name: {name}  |  Function: {func}
 
-SIGNAL FLOW - DIRECT CONSUMERS OF THIS BLOCK:
+DIRECT SIGNAL CONSUMERS (from schematic analysis):
 {i_context}
 
-ALL FAILURE MODES TO ANALYZE ({n} total):
+FAILURE MODES ({n} total):
 {json.dumps(modes, indent=2)}
 
-SAFE MODES (write "No effect" for col I AND col J, do not analyze):
+SAFE MODES - write "No effect" for both I and J, skip reasoning:
 {json.dumps(safe_modes)}
 
-════════════════ COL I RULES ════════════════
+NON-SAFE MODES requiring full analysis:
+{json.dumps(unsafe_modes, indent=2)}
 
-Col I = "Effects on IC output" = what breaks INSIDE the chip downstream of this block.
+========== 6-STEP CHAIN-OF-THOUGHT PROCESS ==========
 
-FORMAT (mandatory):
-  • BLOCK_CODE
-      - specific symptom on that block
-      - second symptom if applicable
-  • ANOTHER_BLOCK_CODE
-      - specific symptom
+For EACH non-safe failure mode, reason through ALL steps:
 
-  Safe modes → write exactly: No effect
+STEP 1 - IDENTIFY THE PHYSICAL OUTPUT SIGNAL
+  What exact physical quantity does {name} produce?
+  Examples: "1.2V bandgap reference voltage", "bias currents for current mirrors",
+            "16MHz clock", "gate drive voltage for MOSFETs", "digitized 8-bit values"
 
-CRITICAL FORMAT RULES:
-  1. Use generic block codes, NOT numbered variants:
-     - Write "SW_BANK_x" or "SW_BANKx" NOT "SW_BANK_1", "SW_BANK_2"
-     - Write "SW_BANK_X" for LOGIC-driven switch control
-     - Write "Vega" for device-level damage (whole IC)
-  2. Use SHORT, precise symptom phrases (under 10 words):
-     - YES: "ADC measurement is incorrect."
-     - YES: "Cannot operate.\n    - Communication error."
-     - NO:  "The ADC conversion results are consistently too high or too low"
-  3. List ONLY the direct consumers from the signal flow context above
-  4. For reference/bias faults: list ALL consumers (bias gen, ADC, temp, LDO, osc)
-  5. For oscillator faults: LOGIC only (digital logic loses clock)
-  6. For CSNS faults: ADC only (CSNS → ADC, nothing else)
-  7. For ADC faults: SW_BANK_x AND ADC self-measurements
-  8. For CP faults: SW_BANK_x (UV) or Vega/device damage (OV)
-  9. For LDO faults: OSC only (LDO powers the oscillator supply rail)
+STEP 2 - TRACE EVERY DIRECT CONSUMER
+  From the DIRECT SIGNAL CONSUMERS list above, identify which blocks physically
+  receive this signal as an input pin. Be exhaustive - missing a consumer = wrong answer.
 
-════════════════ COL J RULES ════════════════
+STEP 3 - DETERMINE SPECIFIC SYMPTOM PER CONSUMER PER MODE
+  For each consumer: "If {code} output is [stuck/floating/incorrect/drifting],
+  what SPECIFICALLY fails in this consumer?"
+  Use IC engineering language:
+    GOOD: "Output reference voltage is stuck"  |  "Cannot operate."  |  "ADC measurement is incorrect."
+    BAD:  "The block is affected"  |  "Values become wrong"
 
-Col J = system-level consequence that the end user or ECU observes.
+STEP 4 - ENUMERATE ALL SUB-EFFECTS (most commonly missed step)
+  Each consumer may have MULTIPLE distinct sub-effects - list each separately.
 
-BLOCK-SPECIFIC J RULES (derived from safety analysis):
-  - REF/BIAS faults (stuck/float/incorrect/accuracy):
-    → "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
-  - LDO faults (OV/UV/accuracy): → "Fail-safe mode active\\nNo communication"
-  - LDO faults (spikes/startup):  → "No effect"
-  - OSC faults (stuck/float/incorrect/freq/drift): → "Fail-safe mode active\\nNo communication"
-  - OSC faults (duty-cycle/jitter): → "No effect"
-  - TEMP stuck: → "Unintentional LED ON"
-  - TEMP float/incorrect/accuracy: → "Unintentional LED ON\\nPossible device damage"
-  - CSNS (ALL modes): → "No effect" (CSNS is monitoring-only, caught by ADC SM)
-  - ADC stuck/float: → "Unintentional LED ON"
-  - ADC non-stuck (accuracy/offset/etc): → "No effect"
-  - CP OV: → "Device damage"
-  - CP UV: → "Unintentional LED ON"
-  - CP safe modes: → "No effect"
-  - LOGIC stuck/float/incorrect: → "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
-  - INTERFACE (ALL modes): → "Fail-safe mode active"
-  - TRIM omission/commission/incorrect: → "Fail-safe mode active\\nNo communication"
-  - TRIM settling: → "No effect"
-  - SW_BANK stuck: → "Unintended LED ON/OFF"
-  - SW_BANK float/res-high: → "Unintended LED ON"
-  - SW_BANK res-low/timing: → "No effect"
+  MANDATORY sub-effect patterns:
+  - Voltage reference stuck -> bias generator gets:
+      (a) Output reference voltage is stuck
+      (b) Output reference current is stuck
+      (c) Output bias current is stuck
+      (d) Quiescent current exceeding the maximum value
+    PLUS: REF itself gets "Quiescent current exceeding the maximum value"
+  - Voltage reference floating -> bias generator gets:
+      (a) Output reference voltage is floating
+      (b) Output reference current is higher than the expected range
+      (c) Output reference current is lower than the expected range
+      (d) Output bias current is higher than the expected range
+      (e) Output bias current is lower than the expected range
+  - Oscillator stuck/float -> LOGIC gets BOTH: "Cannot operate." AND "Communication error."
+  - TEMP sensor stuck -> ADC gets "TEMP output is stuck low" AND SW_BANK_x gets "SW is stuck in off state (DIETEMP)"
+  - Bias current stuck/float -> CNSN block also affected: "Incorrect reading."
 
-{IC_FORMAT}
+STEP 5 - APPLY OUTPUT FORMAT
+  Required format:
+    bullet BLOCK_CODE
+        dash specific symptom
+        dash second symptom if any
+    bullet ANOTHER_BLOCK
+        dash symptom
 
-Return a JSON array with EXACTLY {n} objects, same order as failure modes:
+  CRITICAL RULES:
+  (a) Generic codes only: "SW_BANK_x" NOT "SW_BANK_1"; "SW_BANK_X" for LOGIC-driven switches
+  (b) "Vega" for whole-IC device damage (OV scenarios only)
+  (c) Symptom phrases UNDER 10 WORDS - no long sentences
+  (d) Safe modes -> write exactly: No effect
+
+STEP 6 - DETERMINE COL J (system-level consequence, first matching rule wins)
+  - REF/BIAS non-safe: "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+  - LDO OV/UV/accuracy/drift: "Fail-safe mode active\\nNo communication"
+  - LDO spikes/startup/oscillation-within: "No effect"
+  - OSC stuck/float/freq/swing/drift: "Fail-safe mode active\\nNo communication"
+  - OSC duty-cycle/jitter: "No effect"
+  - TEMP stuck: "Unintentional LED ON"
+  - TEMP float/incorrect/accuracy: "Unintentional LED ON\\nPossible device damage"
+  - CSNS ALL modes: "No effect"
+  - ADC stuck/float: "Unintentional LED ON"
+  - ADC all others (accuracy/offset/linearity/etc): "No effect"
+  - CP OV: "Device damage"
+  - CP UV: "Unintentional LED ON"
+  - CP oscillation/quiescent/spikes/startup: "No effect"
+  - LOGIC ALL 3 modes: "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+  - INTERFACE ALL modes: "Fail-safe mode active"
+  - TRIM omission/commission/incorrect: "Fail-safe mode active\\nNo communication"
+  - TRIM settling: "No effect"
+  - SW_BANK stuck: "Unintended LED ON/OFF"
+  - SW_BANK float/res-high: "Unintended LED ON"
+  - SW_BANK res-low/timing: "No effect"
+
+========== WORKED EXAMPLE (reasoning only - do not copy values) ==========
+
+Block: REF (Voltage Reference)  |  Mode: "Output is stuck (i.e. high or low)"
+
+STEP 1: REF produces a stable 1.2V bandgap voltage used as a reference point.
+STEP 2: Consumers are BIAS (sets mirror currents from REF), ADC (REF as conversion
+        reference), TEMP (comparator reference), LDO (regulation feedback), OSC (freq network).
+        REF also has self-quiescent current.
+STEP 3+4:
+  BIAS: stuck voltage -> (a) ref voltage stuck, (b) ref current stuck, (c) bias current stuck,
+        (d) quiescent current exceeds max
+  REF self: quiescent current exceeds max
+  ADC: REF output is stuck
+  TEMP: Output is stuck
+  LDO: Output is stuck
+  OSC: Oscillation does not start
+STEP 5 output:
+  bullet BIAS
+      dash Output reference voltage is stuck
+      dash Output reference current is stuck
+      dash Output bias current is stuck
+      dash Quiescent current exceeding the maximum value
+  bullet REF
+      dash Quiescent current exceeding the maximum value
+  bullet ADC
+      dash REF output is stuck
+  bullet TEMP
+      dash Output is stuck
+  bullet LDO
+      dash Output is stuck
+  bullet OSC
+      dash Oscillation does not start
+STEP 6: REF non-safe -> "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+
+========== NOW ANALYZE YOUR {n} MODES ==========
+
+Return a JSON array with EXACTLY {n} objects, same order as the modes list:
 [
   {{
-    "G": "<exact failure mode string>",
-    "I": "<col I>",
-    "J": "<col J>"
+    "G": "<copy failure mode string verbatim>",
+    "I": "<col I with bullet+dash format, all sub-effects>",
+    "J": "<col J exact string from Step 6 rules>"
   }},
   ...
 ]
+
+QUALITY CHECK before submitting:
+  - Every non-safe mode has at least one bullet with at least one dash sub-effect
+  - Safe modes have exactly "No effect" for both I and J
+  - No numbered SW_BANK codes (SW_BANK_x or SW_BANK_X only)
+  - Each symptom phrase is under 10 words
+  - J values exactly match the Step 6 rules
+
 Return ONLY the JSON array:"""
 
     raw    = query_llm(prompt, temperature=0.0)
@@ -3243,11 +3379,13 @@ Return ONLY the JSON array:"""
     if isinstance(parsed, list) and len(parsed) >= n:
         for i in range(n):
             rd   = parsed[i]
+            # Post-process I: replace "bullet" with "•" and "dash" with "    -"
+            # in case the LLM used the word form instead of actual symbols
             ic   = str(rd.get('I', 'No effect')).strip()
+            ic   = ic.replace('bullet ', '• ').replace('\ndash ', '\n    - ').replace('\n- ', '\n    - ')
             sys_ = str(rd.get('J', 'No effect')).strip()
             mode = modes[i]
 
-            # Safe modes: override whatever LLM said
             if is_safe_mode(mode):
                 ic   = 'No effect'
                 memo = 'O'
@@ -3266,68 +3404,59 @@ Return ONLY the JSON array:"""
 
 def _validate_j(j_val: str) -> str:
     """
-    Normalize LLM-generated J value to one of the canonical system-effect strings.
-    Handles many phrasing variations the LLM might produce.
+    Normalize LLM J value to canonical strings.
+    Spelling: 'Unintentional' for system-level (REF/BIAS/etc), 'Unintended' for driver (SW_BANK).
+    Both are returned correctly here; the LLM prompt specifies which to use per block.
     """
     if not j_val or j_val.strip() == '':
         return 'No effect'
     j_lower = j_val.lower().strip()
 
-    # Device damage variants
     if 'device damage' in j_lower or 'damage to device' in j_lower:
-        if 'possible' in j_lower:
-            return 'Possible device damage'
-        return 'Device damage'
+        return 'Possible device damage' if 'possible' in j_lower else 'Device damage'
 
-    # No effect variants
     if j_lower in ('no effect', 'none', 'no system effect', 'no impact'):
         return 'No effect'
     if 'no effect' in j_lower and len(j_lower) < 30:
         return 'No effect'
 
-    # Full three-part string — check for all common shorthands for "no communication"
     has_no_comms = any(p in j_lower for p in ['no communication', 'no comms',
                                                'loss of communication', 'comms lost'])
-    has_led = 'led' in j_lower or 'unintention' in j_lower or 'unintended' in j_lower
+    has_led = any(p in j_lower for p in ['led', 'unintention', 'unintended'])
     has_fail = 'fail' in j_lower
 
     if has_no_comms and has_led and has_fail:
         return 'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication'
     if has_no_comms and has_fail:
         return 'Fail-safe mode active\nNo communication'
-
-    # Possible fail-safe
     if 'possible' in j_lower and 'fail' in j_lower:
         return 'Possible Fail-safe mode activation'
-
-    # Fail-safe alone
+    if 'fs mode' in j_lower and 'led' in j_lower:
+        return 'Unintended LED ON/OFF in FS mode'
     if 'fail-safe' in j_lower or 'failsafe' in j_lower or 'fail safe' in j_lower:
         return 'Fail-safe mode active'
 
-    # FS mode (shorthand)
-    if 'fs mode' in j_lower and ('led' in j_lower):
-        return 'Unintended LED ON/OFF in FS mode'
+    # LED ON/OFF combined -- check for both spellings
+    if ('led on/off' in j_lower) or \
+       ('led on' in j_lower and 'led off' in j_lower):
+        # Use 'Unintentional' for system-level (default), 'Unintended' if explicitly stated
+        if 'unintended led' in j_lower and 'unintentional' not in j_lower:
+            return 'Unintended LED ON/OFF'
+        return 'Unintentional LED ON/OFF'
 
-    # LED ON/OFF combined
-    if ('led on' in j_lower and 'led off' in j_lower) or \
-       ('led on/off' in j_lower) or ('unintended led on/off' in j_lower) or \
-       ('unintentional led on/off' in j_lower):
-        return 'Unintended LED ON/OFF'
-
-    # LED ON — catch various phrasings
-    if any(p in j_lower for p in ['led on', 'led turns on', 'led always on',
-                                    'unintended led on', 'unintentional led on',
-                                    'leds on', 'led switch on']):
+    # LED ON
+    if any(p in j_lower for p in ['led on', 'led turns on', 'led always on', 'leds on']):
         if 'off' not in j_lower:
-            return 'Unintended LED ON'
+            if 'unintended led' in j_lower and 'unintentional' not in j_lower:
+                return 'Unintended LED ON'
+            return 'Unintentional LED ON'
 
-    # LED OFF — catch various phrasings
-    if any(p in j_lower for p in ['led off', 'led turns off', 'led always off',
-                                    'unintended led off', 'unintentional led off',
-                                    'leds off', 'led switch off']):
-        return 'Unintended LED OFF'
+    # LED OFF
+    if any(p in j_lower for p in ['led off', 'led turns off', 'led always off', 'leds off']):
+        if 'unintended led' in j_lower and 'unintentional' not in j_lower:
+            return 'Unintended LED OFF'
+        return 'Unintentional LED OFF'
 
-    # Return as-is if no canonical match (preserve LLM output rather than lose it)
     return j_val.strip()
 
 
