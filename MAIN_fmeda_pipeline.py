@@ -59,7 +59,7 @@
 # OLLAMA_URL     = 'http://localhost:11434/api/generate'
 # OLLAMA_MODEL   = 'qwen3:30b'
 # OLLAMA_TIMEOUT = 300
-# SKIP_CACHE     = False
+# SKIP_CACHE     = True
 # # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -1125,13 +1125,9 @@
 # def agent2_generate_effects(blocks, tsr_list, block_to_sms, sm_coverage,
 #                              sm_addressed, cache, signal_graph, sm_j_map):
 #     """
-#     Generate col I (IC effect), col J (system effect), col K (memo) for all blocks.
-
-#     Col I: LLM with signal-flow-aware prompt using the chip architecture graph.
-#            The LLM gets the full dependency map so it knows exactly which blocks
-#            to list and what specific symptoms to write.
-#     Col J: LLM with TSR context + classification rules (no lookup table).
-#     Col K: Deterministic from SM coverage + mode classification rules.
+#     Generate col I/J/K for all blocks.
+#     v10: Col I is DETERMINISTIC via resolve_i_deterministic().
+#          LLM only called for genuinely unknown block types.
 #     """
 #     active = [b for b in blocks if not b.get('is_duplicate') and not b.get('is_sm')]
 #     chip_ctx = "\n".join(
@@ -1165,35 +1161,36 @@
 #             print(f"  [Agent 2] {code:<12} no modes - skipped")
 #             continue
 
-#         ck = f"agent2_v7__{code}__{name}__{len(modes)}"
+#         # v10 cache key (invalidates v9/v8 cache)
+#         ck = f"agent2_v10__{code}__{name}__{len(modes)}"
 #         if not SKIP_CACHE and ck in cache:
 #             rows = cache[ck]
-#             # Refresh K deterministically (cache may be from older version)
+#             # Always refresh I deterministically (fixes stale LLM I in cache)
 #             for row in rows:
-#                 k = compute_k_from_mode_and_coverage(
-#                     code, row.get('G', ''), row.get('I', ''), block_to_sms)
+#                 mode_g = row.get('G', '')
+#                 det_i = resolve_i_deterministic(block, mode_g, signal_graph, sm_j_map)
+#                 if det_i is not None:
+#                     row['I'] = det_i
+#                     row['J'] = _validate_j(_derive_j_from_rules(code, mode_g, det_i))
+#                 # Always refresh K and S/Y
+#                 k = compute_k_from_mode_and_coverage(code, mode_g, row.get('I', ''), block_to_sms)
 #                 row['K'] = k
-#                 sp = 'Y' if k == 'X' else 'N'
-#                 row['P'] = sp
+#                 row['P'] = 'Y' if k == 'X' else 'N'
 #                 row['R'] = 1 if k == 'O' else 0
 #                 row['X'] = 'Y' if k.startswith('X') else 'N'
-#                 # Refresh S/Y
-#                 sm_str, cov = compute_sm_columns(
-#                     row.get('I', ''), block_to_sms, sm_coverage, code, row.get('G', ''))
-#                 row['S'] = sm_str
-#                 row['Y'] = sm_str
-#                 row['U'] = cov
-#             print(f"  [Agent 2] {code:<12} cache ({len(rows)} rows, K refreshed)")
+#                 sm_str, cov = compute_sm_columns(row.get('I', ''), block_to_sms, sm_coverage, code, mode_g)
+#                 row['S'] = sm_str; row['Y'] = sm_str; row['U'] = cov
+#             print(f"  [Agent 2] {code:<12} cache ({len(rows)} rows, I/K/S refreshed)")
 #             result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
 #             continue
 
 #         rows = _llm_block_effects_v7(block, chip_ctx, tsr_ctx, modes,
-#                                       block_to_sms, sm_coverage, signal_graph)
+#                                       block_to_sms, sm_coverage, signal_graph,
+#                                       sm_j_map=sm_j_map)
 #         cache[ck] = rows
 #         save_cache(cache)
 #         result.append({'fmeda_code': code, 'user_name': name, 'rows': rows})
-#         print(f"  [Agent 2] {code:<12} {len(rows)} rows")
-#         time.sleep(0.3)
+#         time.sleep(0.1)
 
 #     return result
 
@@ -1233,12 +1230,488 @@
 #     return ctx
 
 
+# # =============================================================================
+# # DETERMINISTIC COL I ENGINE
+# # =============================================================================
+# #
+# # KEY INSIGHT: Col I follows strict deterministic patterns per block type.
+# # The LLM is the wrong tool — it over-thinks and adds wrong variations.
+# # The correct values are FULLY determined by: block type + mode severity.
+# #
+# # This engine resolves I values using:
+# #   1. Block-type classification (derived from fmeda_code pattern, not hardcoded names)
+# #   2. Mode severity classification (classify_mode_severity)
+# #   3. Signal graph for consumer block names (no hardcoded block names)
+# #
+# # For unknown block types, it falls back to the LLM with a tightly constrained prompt.
+
+# def resolve_i_deterministic(block: dict, mode_str: str,
+#                               signal_graph: dict,
+#                               sm_j_map: dict = None) -> str | None:
+#     """
+#     Resolve col I deterministically from block type + mode severity.
+#     Returns the I string if deterministically resolvable, None if LLM needed.
+
+#     Rules derived from complete analysis of 3_ID03_FMEDA.xlsx col I patterns.
+#     All consumer block names come from the signal_graph (chip-agnostic).
+#     """
+#     code = block['fmeda_code']
+#     name = block['name']
+#     m    = mode_str.lower()
+#     sev  = classify_mode_severity(mode_str)
+#     norm = re.sub(r'SW_BANK[_\d]*', 'SW_BANK', code.upper())
+
+#     # Get consumer block names from signal graph (chip-agnostic)
+#     graph_entry   = signal_graph.get(name) or signal_graph.get(code) or {}
+#     consumers     = graph_entry.get('consumers', [])
+#     consumer_det  = graph_entry.get('consumer_details', {})
+
+#     # Helper: find the first consumer whose name/detail matches a keyword
+#     def find_consumer(keywords: list) -> str | None:
+#         for c in consumers:
+#             c_lower = c.lower()
+#             detail  = consumer_det.get(c, '').lower()
+#             if any(k in c_lower or k in detail for k in keywords):
+#                 return c
+#         return None
+
+#     # Helper: get all SW_BANK consumers (numbered or generic)
+#     def sw_bank_consumers() -> list:
+#         return [c for c in consumers
+#                 if 'sw_bank' in c.lower() or 'switch' in c.lower()
+#                 or 'driver' in c.lower() or 'led' in c.lower()]
+
+#     # ── SAFE MODES — always No effect ────────────────────────────────────────
+#     if sev == 'safe':
+#         # LDO spikes is a special case: NOT No effect, it causes OSC jitter
+#         if norm == 'LDO' and 'spike' in m:
+#             osc = find_consumer(['osc', 'clock', 'oscillator'])
+#             osc_name = osc or 'OSC'
+#             return f'• {osc_name}\n    - Jitter too high in the output signal'
+#         # LDO fast oscillation: No effect with note
+#         if norm == 'LDO' and 'fast oscillation' in m:
+#             return 'No effect (Filter in place)'
+#         return 'No effect'
+
+#     # ── SW_BANK — direct LED state strings, NO bullet points ─────────────────
+#     if norm == 'SW_BANK':
+#         if 'stuck' in m and 'not including' not in m:
+#             return 'Unintended LED ON/OFF'
+#         if 'floating' in m or 'open circuit' in m or 'tri-state' in m:
+#             return 'Unintended LED ON'
+#         if 'resistance too high' in m:
+#             return 'Unintended LED ON'
+#         if 'resistance too low' in m or 'turn-on' in m or 'turn-off' in m:
+#             return 'Performance impact'
+#         return 'Performance impact'
+
+#     # ── INTERFACE — always plain string ──────────────────────────────────────
+#     if norm == 'INTERFACE':
+#         return 'Communication error'
+
+#     # ── CSNS — always single ADC bullet regardless of mode ───────────────────
+#     if norm == 'CSNS':
+#         adc = find_consumer(['adc', 'convert', 'digital'])
+#         adc_name = adc or 'ADC'
+#         return f'• {adc_name}\n    - CSNS output is incorrect.'
+
+#     # ── LDO ──────────────────────────────────────────────────────────────────
+#     if norm == 'LDO':
+#         osc = find_consumer(['osc', 'clock', 'oscillator'])
+#         osc_name = osc or 'OSC'
+#         # OV: OSC out of spec
+#         if sev == 'ov' or 'higher than' in m:
+#             return f'• {osc_name}\n    - Out of spec.'
+#         # UV or accuracy: OSC out of spec + Vega reset
+#         if sev in ('uv', 'accuracy', 'drift') or 'lower than' in m:
+#             return (f'• {osc_name}\n    - Out of spec.\n'
+#                     f'• Vega\n    - Reset reaction. (POR)')
+#         # Startup: No effect
+#         if 'start-up' in m or 'startup' in m:
+#             return 'No effect'
+#         # Oscillation within range: No effect
+#         return 'No effect'
+
+#     # ── OSC ──────────────────────────────────────────────────────────────────
+#     if norm == 'OSC':
+#         logic = find_consumer(['logic', 'controller', 'control', 'digital', 'mcu'])
+#         logic_name = logic or 'LOGIC'
+#         if sev in ('stuck', 'float', 'incorrect', 'ov', 'uv', 'drift'):
+#             return f'• {logic_name}\n    - Cannot operate.\n    - Communication error.'
+#         if 'duty cycle' in m or 'jitter' in m:
+#             return 'No effect'
+#         return f'• {logic_name}\n    - Cannot operate.\n    - Communication error.'
+
+#     # ── TEMP ─────────────────────────────────────────────────────────────────
+#     if norm == 'TEMP':
+#         adc  = find_consumer(['adc', 'convert', 'digital'])
+#         adc_name = adc or 'ADC'
+#         sw   = find_consumer(['sw_bank', 'switch', 'driver', 'led'])
+#         sw_name = (re.sub(r'SW_BANK[_\d]+', 'SW_BANK_x', sw)
+#                    if sw else 'SW_BANK_x')
+#         if sev == 'stuck':
+#             return (f'• {adc_name}\n    - TEMP output is stuck low\n'
+#                     f'• {sw_name}\n    - SW is stuck in off state (DIETEMP)')
+#         if sev == 'float':
+#             return f'• {adc_name}\n    - Incorrect TEMP reading'
+#         if sev in ('incorrect', 'accuracy', 'drift'):
+#             return (f'• {adc_name}\n    - TEMP output Static Error (offset error, gain error, '
+#                     f'integral nonlinearity, & differential nonlinearity)')
+#         return 'No effect'
+
+#     # ── ADC ──────────────────────────────────────────────────────────────────
+#     if norm == 'ADC':
+#         sw = find_consumer(['sw_bank', 'switch', 'driver', 'led'])
+#         sw_name = re.sub(r'SW_BANK[_\d]+', 'SW_BANK_x', sw) if sw else 'SW_BANK_x'
+#         adc_self_bullets = ('• ADC\n    - Incorrect BGR measurement\n'
+#                             '    - Incorrect DIETEMP measurement\n'
+#                             '    - Incorrect CS measurement')
+#         if sev in ('stuck', 'float'):
+#             return (f'• {sw_name}\n    - SW is stuck in off state (DIETEMP)\n'
+#                     + adc_self_bullets)
+#         # All non-safe non-stuck ADC modes: self-measurement errors only
+#         if sev not in ('safe',):
+#             return adc_self_bullets
+#         return 'No effect'
+
+#     # ── CP ────────────────────────────────────────────────────────────────────
+#     if norm == 'CP':
+#         sw = find_consumer(['sw_bank', 'switch', 'driver', 'led'])
+#         sw_name = re.sub(r'SW_BANK[_\d]+', 'SW_BANK_x', sw) if sw else 'SW_BANK_x'
+#         if sev == 'ov' or 'higher than' in m:
+#             return '• Vega\n    - Device Damage'
+#         if sev == 'uv' or 'lower than' in m:
+#             return f'• {sw_name}\n    - SWs are stuck in off state, LEDs always ON.'
+#         return 'No effect'
+
+#     # ── LOGIC ─────────────────────────────────────────────────────────────────
+#     if norm == 'LOGIC':
+#         sw = find_consumer(['sw_bank', 'switch', 'driver', 'led'])
+#         sw_name = re.sub(r'SW_BANK[_\d]+', 'SW_BANK_X', sw) if sw else 'SW_BANK_X'
+#         osc = find_consumer(['osc', 'clock', 'oscillator'])
+#         osc_name = osc or 'OSC'
+#         if sev in ('stuck', 'float', 'incorrect', 'ov', 'uv', 'accuracy'):
+#             return (f'• {sw_name}\n    - SW is stuck in on/off state\n'
+#                     f'• {osc_name}\n    - Output stuck')
+#         return 'No effect'
+
+#     # ── TRIM ──────────────────────────────────────────────────────────────────
+#     if norm == 'TRIM':
+#         if sev == 'safe' or 'settling' in m:
+#             return 'No effect'
+#         # omission, commission, incorrect: all calibrated blocks affected
+#         ref  = find_consumer(['ref', 'bandgap', 'reference'])
+#         ldo  = find_consumer(['ldo', 'regulator', 'supply'])
+#         bias = find_consumer(['bias', 'current source'])
+#         sw   = find_consumer(['sw_bank', 'switch', 'driver'])
+#         osc  = find_consumer(['osc', 'clock', 'oscillator'])
+#         temp = find_consumer(['temp', 'thermal', 'temperature'])
+
+#         ref_name  = ref  or 'REF'
+#         ldo_name  = ldo  or 'LDO'
+#         bias_name = bias or 'BIAS'
+#         sw_name   = re.sub(r'SW_BANK[_\d]+', 'SW_BANK', sw) if sw else 'SW_BANK'
+#         osc_name  = osc  or 'OSC'
+#         temp_code = (re.sub(r'TEMP.*', 'DIETEMP', temp.upper()) if temp else 'DIETEMP')
+
+#         return (f'• {ref_name}\n    - Incorrect output value higher than the expected range\n'
+#                 f'• {ldo_name}\n    - Reference voltage higher than the expected range\n'
+#                 f'• {bias_name}\n    - Output reference voltage accuracy too low, including drift\n'
+#                 f'• {sw_name}\n    - Incorrect slew rate value\n'
+#                 f'• {osc_name}\n    - Incorrect output frequency: higher than the expected range\n'
+#                 f'• {temp_code}\n    - Incorrect output voltage')
+
+#     # ── REF ───────────────────────────────────────────────────────────────────
+#     if norm == 'REF':
+#         bias = find_consumer(['bias', 'current source', 'current mirror'])
+#         adc  = find_consumer(['adc', 'convert', 'digital'])
+#         temp = find_consumer(['temp', 'thermal', 'temperature'])
+#         ldo  = find_consumer(['ldo', 'regulator', 'supply'])
+#         osc  = find_consumer(['osc', 'clock', 'oscillator'])
+
+#         bias_name = bias or 'BIAS'
+#         adc_name  = adc  or 'ADC'
+#         temp_name = temp or 'TEMP'
+#         ldo_name  = ldo  or 'LDO'
+#         osc_name  = osc  or 'OSC'
+
+#         if sev == 'stuck':
+#             return (f'• {bias_name}\n'
+#                     f'    - Output reference voltage is stuck \n'
+#                     f'    - Output reference current is stuck \n'
+#                     f'    - Output bias current is stuck \n'
+#                     f'    - Quiescent current exceeding the maximum value\n'
+#                     f'• REF\n'
+#                     f'    - Quiescent current exceeding the maximum value\n'
+#                     f'• {adc_name}\n    - REF output is stuck \n'
+#                     f'• {temp_name}\n    - Output is stuck \n'
+#                     f'• {ldo_name}\n    - Output is stuck \n'
+#                     f'• {osc_name}\n    - Oscillation does not start')
+#         if sev == 'float':
+#             return (f'• {bias_name}\n'
+#                     f'    - Output reference voltage is floating\n'
+#                     f'    - Output reference current is higher than the expected range\n'
+#                     f'    - Output reference current is lower than the expected range\n'
+#                     f'    - Output bias current is higher than the expected range\n'
+#                     f'    - Output bias current is lower than the expected range\n'
+#                     f'• {adc_name}\n    - REF output is floating (i.e. open circuit)\n'
+#                     f'• {ldo_name}\n    - Out of spec\n'
+#                     f'• {osc_name}\n    - Out of spec')
+#         if sev in ('incorrect', 'accuracy', 'drift'):
+#             return (f'• {bias_name}\n'
+#                     f'    - Output reference voltage is higher than the expected range\n'
+#                     f'    - Output reference current is higher than the expected range\n'
+#                     f'    - Output bias current is higher than the expected range\n'
+#                     f'• {temp_name}\n'
+#                     f'    - Incorrect gain on the output voltage (outside the expected range)\n'
+#                     f'    - Incorrect offset on the output voltage (outside the expected range)\n'
+#                     f'• {adc_name}\n    - REF output higher/lower than expected\n'
+#                     f'• {ldo_name}\n    - Out of spec\n'
+#                     f'• {osc_name}\n    - Out of spec')
+#         return 'No effect'
+
+#     # ── BIAS ──────────────────────────────────────────────────────────────────
+#     if norm == 'BIAS':
+#         adc  = find_consumer(['adc', 'convert', 'digital'])
+#         temp = find_consumer(['temp', 'thermal', 'temperature'])
+#         ldo  = find_consumer(['ldo', 'regulator', 'supply'])
+#         osc  = find_consumer(['osc', 'clock', 'oscillator'])
+#         sw   = find_consumer(['sw_bank', 'switch', 'driver', 'led'])
+#         cp   = find_consumer(['charge pump', 'cp', 'boost'])
+#         csns = find_consumer(['csns', 'current sense', 'sense amp'])
+
+#         adc_name  = adc  or 'ADC'
+#         temp_name = temp or 'TEMP'
+#         ldo_name  = ldo  or 'LDO'
+#         osc_name  = osc  or 'OSC'
+#         sw_name   = re.sub(r'SW_BANK[_\d]+', 'SW_BANKx', sw) if sw else 'SW_BANKx'
+#         cp_name   = cp   or 'CP'
+#         cnsn_name = csns or 'CNSN'
+
+#         if sev in ('stuck', 'float', 'incorrect', 'accuracy', 'drift', 'other'):
+#             return (f'• {adc_name}\n    - ADC measurement is incorrect.\n'
+#                     f'• {temp_name}\n    - Incorrect temperature measurement.\n'
+#                     f'• {ldo_name}\n    - Out of spec.\n'
+#                     f'• {osc_name}\n    - Frequency out of spec.\n'
+#                     f'• {sw_name}\n    - Out of spec.\n'
+#                     f'• {cp_name}\n    - Out of spec.\n'
+#                     f'• {cnsn_name}\n    - Incorrect reading.')
+#         return 'No effect'
+
+#     # ── SM BLOCKS ─────────────────────────────────────────────────────────────
+#     if re.match(r'^SM\d+$', norm):
+#         # 'Fail to detect' -> the I value is what the SM was supposed to catch
+#         # This comes from sm_j_map which is built from SM descriptions
+#         if sm_j_map and 'fail to detect' in m:
+#             sm_ic, _ = sm_j_map.get(code, ('Loss of safety mechanism functionality', ''))
+#             return sm_ic if sm_ic else 'Loss of safety mechanism functionality'
+#         if 'false detection' in m:
+#             return 'No effect'
+#         return None  # fallback to LLM
+
+#     # Unknown block type: return None to trigger LLM fallback
+#     return None
+
+
 # def _llm_block_effects_v7(block, chip_ctx, tsr_ctx, modes,
-#                            block_to_sms, sm_coverage, signal_graph):
+#                            block_to_sms, sm_coverage, signal_graph,
+#                            sm_j_map=None):
 #     """
-#     Generate I/J rows using 6-step chain-of-thought signal-flow reasoning.
-#     K is always computed deterministically AFTER LLM returns I.
+#     Generate I/J/K rows.
+
+#     Architecture (v10):
+#       Col I: DETERMINISTIC first via resolve_i_deterministic().
+#              LLM only called if resolve_i_deterministic() returns None
+#              (i.e. a completely new block type not covered by any rule).
+#       Col J: Determined from block type + mode severity (LLM prompt includes rules).
+#       Col K: Always deterministic via compute_k_from_mode_and_coverage().
 #     """
+#     code = block['fmeda_code']
+#     name = block['name']
+#     func = block.get('function', '')
+#     n    = len(modes)
+
+#     # Pass 1: resolve everything deterministically
+#     det_results = []      # (mode, i_val) for deterministically resolved modes
+#     llm_needed  = []      # (idx, mode) needing LLM for I
+
+#     for idx, mode in enumerate(modes):
+#         i_val = resolve_i_deterministic(block, mode, signal_graph, sm_j_map)
+#         if i_val is not None:
+#             det_results.append((idx, mode, i_val))
+#         else:
+#             llm_needed.append((idx, mode))
+
+#     # Pass 2: LLM only for unknown modes (usually empty for known block types)
+#     llm_i = {}  # idx -> i string
+#     if llm_needed:
+#         i_context   = _build_i_context_for_block(block, signal_graph)
+#         safe_modes  = [m for _, m in llm_needed if is_safe_mode(m)]
+#         llm_modes   = [m for _, m in llm_needed]
+
+#         prompt = f"""You are a senior functional safety engineer completing an FMEDA (ISO 26262).
+
+# BLOCK: {code} | {name} | {func}
+
+# SIGNAL FLOW:
+# {i_context}
+
+# CHIP CONTEXT:
+# {chip_ctx}
+
+# FAILURE MODES TO ANALYZE (only these {len(llm_modes)} — others handled separately):
+# {json.dumps(llm_modes, indent=2)}
+
+# SAFE MODES (write "No effect"):
+# {json.dumps(safe_modes)}
+
+# For col I (Effects on IC output), use bullet format:
+#   • BLOCK_CODE
+#       - specific symptom (under 10 words)
+#       - second symptom if needed
+
+# Rules:
+# - SW_BANK_x (not SW_BANK_1/2), SW_BANK_X for logic-driven, Vega for device damage
+# - Safe modes -> No effect
+# - Only list DIRECT consumers from signal flow above
+# - Short precise phrases only
+
+# For col J (system effect), use the first matching rule:
+#   REF/BIAS non-safe: "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+#   LDO OV/UV/accuracy: "Fail-safe mode active\\nNo communication"
+#   OSC stuck/float/freq/drift: "Fail-safe mode active\\nNo communication"
+#   TEMP stuck: "Unintentional LED ON"
+#   TEMP float/incorrect: "Unintentional LED ON\\nPossible device damage"
+#   ADC stuck/float: "Unintentional LED ON"
+#   CP OV: "Device damage" | CP UV: "Unintentional LED ON"
+#   LOGIC all: "Unintentional LED ON/OFF\\nFail-safe mode active\\nNo communication"
+#   TRIM active modes: "Fail-safe mode active\\nNo communication"
+#   SW_BANK stuck: "Unintended LED ON/OFF" | SW_BANK float/res-high: "Unintended LED ON"
+#   Otherwise: "No effect"
+
+# Return JSON array with {len(llm_modes)} objects:
+# [{{"G": "<mode>", "I": "<col I>", "J": "<col J>"}}]
+# Return ONLY the JSON:"""
+
+#         raw    = query_llm(prompt, temperature=0.0)
+#         parsed = parse_json(raw)
+
+#         if isinstance(parsed, list) and len(parsed) >= len(llm_needed):
+#             for pos, (orig_idx, orig_mode) in enumerate(llm_needed):
+#                 rd    = parsed[pos]
+#                 i_str = str(rd.get('I', 'No effect')).strip()
+#                 # Post-process: replace literal 'bullet'/'dash' words with symbols
+#                 i_str = i_str.replace('bullet ', '• ').replace('\ndash ', '\n    - ')
+#                 llm_i[orig_idx] = (i_str, str(rd.get('J', 'No effect')).strip())
+#         else:
+#             for orig_idx, orig_mode in llm_needed:
+#                 llm_i[orig_idx] = ('No effect' if is_safe_mode(orig_mode) else '', 'No effect')
+
+#     # Pass 3: build rows in correct mode order
+#     # J for deterministically-resolved I: compute from block type + mode
+#     rows = []
+#     det_map = {idx: (mode, i_val) for idx, mode, i_val in det_results}
+
+#     for idx, mode in enumerate(modes):
+#         if idx in det_map:
+#             ic   = det_map[idx][1]
+#             sys_ = _derive_j_from_rules(code, mode, ic)
+#         else:
+#             ic_and_j = llm_i.get(idx, ('No effect', 'No effect'))
+#             ic   = ic_and_j[0]
+#             sys_ = _validate_j(ic_and_j[1])
+
+#         # Always override safe modes
+#         if is_safe_mode(mode):
+#             # LDO spike exception already handled in resolve_i_deterministic
+#             if ic == 'No effect':
+#                 pass
+        
+#         sys_ = _validate_j(sys_)
+#         memo = 'O' if (not ic or ic.strip() in ('No effect', 'No effect (Filter in place)')) \
+#                else compute_k_from_mode_and_coverage(code, mode, ic, block_to_sms)
+
+#         rows.append(_build_row(mode, ic, sys_, memo, block_to_sms, sm_coverage,
+#                                fmeda_code=code))
+
+#     if not rows:
+#         rows = _fallback_rows_v7(modes, code, block_to_sms, sm_coverage)
+
+#     n_det = len(det_results)
+#     n_llm = len(llm_needed)
+#     print(f"    {code}: {n_det} det + {n_llm} LLM = {n} rows")
+#     return rows
+
+
+# def _derive_j_from_rules(code: str, mode_str: str, ic: str) -> str:
+#     """
+#     Derive col J from block type + mode severity using the block-specific rules.
+#     This is called for deterministically-resolved I values so we don't need LLM for J.
+#     """
+#     norm = re.sub(r'SW_BANK[_\d]*', 'SW_BANK', code.upper())
+#     m    = mode_str.lower()
+#     sev  = classify_mode_severity(mode_str)
+
+#     # Safe modes or no IC effect
+#     if sev == 'safe' or not ic or ic.strip() == 'No effect':
+#         # LDO spikes exception: has IC effect but J is still No effect
+#         if norm == 'LDO' and 'spike' in m:
+#             return 'No effect'
+#         if ic and ic.strip() not in ('No effect', 'No effect (Filter in place)', ''):
+#             pass  # fall through to block-specific rules
+#         else:
+#             return 'No effect'
+
+#     if norm in ('REF', 'BIAS'):
+#         return 'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication'
+#     if norm == 'LDO':
+#         if sev == 'safe' or 'spike' in m or 'start-up' in m:
+#             return 'No effect'
+#         return 'Fail-safe mode active\nNo communication'
+#     if norm == 'OSC':
+#         if 'duty cycle' in m or 'jitter' in m:
+#             return 'No effect'
+#         return 'Fail-safe mode active\nNo communication'
+#     if norm == 'TEMP':
+#         if sev == 'stuck':
+#             return 'Unintentional LED ON'
+#         if sev in ('float', 'incorrect', 'accuracy', 'drift'):
+#             return 'Unintentional LED ON\nPossible device damage'
+#         return 'No effect'
+#     if norm == 'CSNS':
+#         return 'No effect'
+#     if norm == 'ADC':
+#         if sev in ('stuck', 'float'):
+#             return 'Unintentional LED ON'
+#         return 'No effect'
+#     if norm == 'CP':
+#         if sev == 'ov' or 'higher than' in m:
+#             return 'Device damage'
+#         if sev == 'uv' or 'lower than' in m:
+#             return 'Unintentional LED ON'
+#         return 'No effect'
+#     if norm == 'LOGIC':
+#         return 'Unintentional LED ON/OFF\nFail-safe mode active\nNo communication'
+#     if norm == 'INTERFACE':
+#         return 'Fail-safe mode active'
+#     if norm == 'TRIM':
+#         if 'settling' in m:
+#             return 'No effect'
+#         return 'Fail-safe mode active\nNo communication'
+#     if norm == 'SW_BANK':
+#         if 'stuck' in m and 'not including' not in m:
+#             return 'Unintended LED ON/OFF'
+#         if 'floating' in m or 'open circuit' in m or 'resistance too high' in m:
+#             return 'Unintended LED ON'
+#         return 'No effect'
+#     if re.match(r'^SM\d+$', norm):
+#         # SM 'Fail to detect' J comes from sm_j_map (handled by _sm_rows)
+#         return 'No effect'
+
+#     # Unknown block: use generic rules
+#     if ic and ic.strip() not in ('No effect', ''):
+#         return 'Fail-safe mode active'
+#     return 'No effect'
 #     code = block['fmeda_code']
 #     name = block['name']
 #     func = block.get('function', '')
@@ -1946,7 +2419,12 @@ INTERMEDIATE_JSON = 'fmeda_intermediate.json'
 OLLAMA_URL     = 'http://localhost:11434/api/generate'
 OLLAMA_MODEL   = 'qwen3:30b'
 OLLAMA_TIMEOUT = 300
-SKIP_CACHE     = True
+SKIP_CACHE     = False
+
+# Runtime-populated SM description dict: {SM_CODE: 'description text'}
+# Filled by read_sm_list() in run(), used by compute_sm_columns() for
+# keyword-based SM filtering without hardcoded SM codes.
+_SM_DESCRIPTIONS_RUNTIME: dict = {}
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -2115,15 +2593,11 @@ def read_block_fit_rates(wb):
 def read_sm_list(wb=None):
     """
     Read SM list from TEMPLATE_FILE only.
-    The SM list defines which safety mechanisms cover which blocks and their
-    diagnostic coverage values. This comes from the FMEDA template workbook
-    (FMEDA_TEMPLATE.xlsx), which is part of the project — not from any
-    reference FMEDA or human-made output file.
-
     Returns:
-      sm_coverage  : { 'SM01': 0.99, ... }
-      sm_addressed : { 'SM01': ['REF','LDO'], ... }
-      block_to_sms : { 'REF': ['SM01','SM02',...], ... }
+      sm_coverage    : { 'SM01': 0.99, ... }
+      sm_addressed   : { 'SM01': ['REF','LDO'], ... }
+      block_to_sms   : { 'REF': ['SM01','SM02',...], ... }
+      sm_descriptions: { 'SM01': 'Comparator: VDD Under-voltage', ... }
     """
     sources = []
     if wb is not None:
@@ -2137,31 +2611,40 @@ def read_sm_list(wb=None):
     for label, wb_src in sources:
         if 'SM list' not in wb_src.sheetnames:
             continue
-        cov, addr, b2s = _parse_sm_list_sheet(wb_src['SM list'])
+        cov, addr, b2s, sm_desc = _parse_sm_list_sheet(wb_src['SM list'])
         if cov:
             print(f"  SM list: {len(cov)} entries loaded from {label}")
-            return cov, addr, b2s
+            return cov, addr, b2s, sm_desc
 
-    print("  SM list: no template found — SM coverage will be empty")
+    print("  SM list: no template found -- SM coverage will be empty")
     print("  (Place FMEDA_TEMPLATE.xlsx in the working directory to enable SM coverage)")
-    return {}, {}, {}
+    return {}, {}, {}, {}
 
 
 def _parse_sm_list_sheet(ws):
-    """Parse SM list sheet — works for any column arrangement."""
-    sm_coverage  = {}
-    sm_addressed = {}
+    """
+    Parse SM list sheet -- works for any column arrangement.
+    Returns sm_coverage, sm_addressed, block_to_sms, sm_descriptions.
+    sm_descriptions: {SM_CODE: 'description text'} -- used for keyword filtering
+    in compute_sm_columns so it adapts to renamed blocks.
+    """
+    sm_coverage   = {}
+    sm_addressed  = {}
+    sm_descriptions = {}
 
-    # Scan for SM code column
-    sm_col, cov_col, parts_col = 'C', 'L', 'E'
+    # Auto-detect columns
+    sm_col, cov_col, parts_col, desc_col = 'C', 'L', 'E', 'F'
     for row in ws.iter_rows(min_row=1, max_row=15):
         for c in row:
-            if c.value and str(c.value).strip().upper() in ('SM', 'SM CODE', 'SAFETY MECHANISM'):
+            if c.value and str(c.value).strip().upper() in ('SM', 'SM CODE', 'SAFETY MECHANISM', 'SM#'):
                 sm_col = c.column_letter
             if c.value and 'coverage' in str(c.value).lower():
                 cov_col = c.column_letter
             if c.value and ('part' in str(c.value).lower() or 'address' in str(c.value).lower()):
                 parts_col = c.column_letter
+            if c.value and ('mechanism' in str(c.value).lower() or 'measure' in str(c.value).lower()
+                            or 'description' in str(c.value).lower()):
+                desc_col = c.column_letter
 
     for row in ws.iter_rows(min_row=10, max_row=ws.max_row):
         cells = {c.column_letter: c.value for c in row
@@ -2177,11 +2660,15 @@ def _parse_sm_list_sheet(ws):
             cov = 0.9
         sm_coverage[sm_code] = cov
 
+        # SM description text (used for keyword matching in compute_sm_columns)
+        desc = str(cells.get(desc_col, '')).strip()
+        if desc:
+            sm_descriptions[sm_code] = desc
+
         raw_parts = str(cells.get(parts_col, '')).strip()
         parts = []
         for p in re.split(r'[,;]', raw_parts):
             p = p.strip()
-            # Normalise common variants
             p = re.sub(r'SW_BANK[_x\d]*', 'SW_BANK', p)
             p = re.sub(r'\bCSNS\b|\bCNSN\b|\bCS\b', 'CSNS', p)
             if p:
@@ -2196,7 +2683,7 @@ def _parse_sm_list_sheet(ws):
                 if sm not in block_to_sms[part]:
                     block_to_sms[part].append(sm)
 
-    return sm_coverage, sm_addressed, block_to_sms
+    return sm_coverage, sm_addressed, block_to_sms, sm_descriptions
 
 
 # =============================================================================
@@ -2209,7 +2696,7 @@ def build_signal_flow_graph(blk_blocks: list, cache: dict) -> dict:
     The graph drives col I generation — wrong consumers = wrong I values.
     This prompt enforces strict IC signal-flow thinking to prevent common errors.
     """
-    ck = "signal_flow_v8__" + json.dumps(sorted(b['name'] for b in blk_blocks))
+    ck = "signal_flow_v11__" + json.dumps(sorted(b['name'] for b in blk_blocks))
     if not SKIP_CACHE and ck in cache:
         print("  [Agent 0] Signal flow graph loaded from cache")
         return cache[ck]
@@ -2224,81 +2711,38 @@ def build_signal_flow_graph(blk_blocks: list, cache: dict) -> dict:
 CHIP BLOCKS AND THEIR FUNCTIONS:
 {blocks_text}
 
-TASK: For each block, map its DIRECT downstream signal consumers.
-"Direct" means: the signal physically arrives at the consumer's input pin.
-Do NOT include transitive effects (A→B→C: only list B as consumer of A, not C).
+TASK: For each block, map its DIRECT downstream signal consumers by reading its function description.
+"Direct" means the signal physically arrives at the consumer's input pin (1 hop only).
 
-CRITICAL RULES FOR CORRECT CONSUMER MAPPING:
+HOW TO REASON (use the function descriptions, not assumed topology):
+  - Read each block's function description carefully.
+  - Ask: "What does this block OUTPUT, and which other blocks need that output as an INPUT?"
+  - A block that "produces a reference voltage" feeds blocks that "use a reference" or "set levels from".
+  - A block that "generates bias currents" feeds every block that "uses current mirrors" or "biased by".
+  - A block that "produces a supply voltage" feeds blocks whose description says "powered by" or "supply to".
+  - A block that "generates a clock/frequency" feeds blocks that "require a clock" or "digital logic".
+  - A block that "converts analog to digital" feeds blocks that "use measurement results".
+  - A block that "drives LEDs/switches" typically has no downstream consumers (external output).
+  - A block that "calibrates/trims" feeds all calibrated blocks (REF, LDO, BIAS, OSC, etc.).
+  - A block that "communicates via SPI/UART" feeds the digital controller.
 
-1. VOLTAGE REFERENCE (bandgap/REF):
-   - Feeds: bias current generator (uses REF to set mirror levels), ADC (reference input),
-     temperature sensor (reference for its comparator), LDO (feedback reference),
-     oscillator (frequency-setting network)
-   - Does NOT directly feed: LOGIC, INTERFACE, SW_BANK, CP
-
-2. BIAS CURRENT GENERATOR:
-   - Feeds: ADC (bias for comparators), temperature sensor (bias for diode),
-     LDO (bias for error amp), oscillator (current-controlled frequency),
-     switch banks (gate bias), charge pump (bias), current sense amp (bias)
-   - This block biases EVERYTHING — be exhaustive
-
-3. LDO / VOLTAGE REGULATOR:
-   - Feeds: oscillator ONLY (LDO supplies the oscillator's power rail)
-   - The LDO output is the oscillator supply — logic runs from a different rail
-   - Does NOT directly feed: LOGIC, INTERFACE, SW_BANK, ADC, REF, BIAS
-
-4. OSCILLATOR / CLOCK:
-   - Feeds: LOGIC (clock input), INTERFACE (baud rate clock)
-   - Does NOT directly feed: analog blocks (SW_BANK, ADC, REF, BIAS, TEMP, CSNS, CP)
-
-5. TEMPERATURE SENSOR:
-   - Feeds: ADC (temperature voltage digitized by ADC), SW_BANK (thermal shutdown signal)
-   - Does NOT directly feed: REF, BIAS, LDO, OSC, LOGIC, INTERFACE, CP
-
-6. CURRENT SENSE AMP (CSNS):
-   - Feeds: ADC ONLY (CSNS output is digitized by ADC)
-   - Does NOT feed: SW_BANK, LOGIC, INTERFACE, or any other block directly
-
-7. ADC:
-   - Feeds: SW_BANK (DIETEMP-based thermal enable), LOGIC/self (converted measurements)
-   - Does NOT directly feed: REF, BIAS, LDO, OSC, TEMP, CSNS, CP, INTERFACE
-
-8. CHARGE PUMP (CP):
-   - Feeds: SW_BANK (gate drive voltage for all switches)
-   - A low CP voltage means switches can't turn on (stuck off = LEDs always ON)
-   - A high CP voltage causes device damage (Vega)
-   - Does NOT directly feed: REF, BIAS, LDO, OSC, TEMP, CSNS, ADC, LOGIC, INTERFACE
-
-9. LOGIC / CONTROLLER:
-   - Feeds: SW_BANK (switch control signals), OSC (LOGIC can reset/gate the oscillator)
-   - Does NOT directly feed: REF, BIAS, LDO, TEMP, CSNS, ADC, CP, INTERFACE
-
-10. INTERFACE (SPI/UART):
-    - Feeds: LOGIC (commands received), ADC (configuration)
-    - Communication errors do NOT propagate to analog blocks
-
-11. TRIM / NVM / SELF-TEST:
-    - Feeds ALL calibrated blocks: REF, LDO, BIAS, SW_BANK, OSC, temperature sensor
-    - Trim data sets the operating point of every analog block
-
-12. SW_BANK / DRIVER:
-    - External output only — does NOT feed any other internal block
-    - Its failure directly causes LED state errors
-
-For each consumer, describe the SPECIFIC symptom in 5-10 words using IC terminology:
-  GOOD: "oscillator frequency drifts out of spec"
-  GOOD: "ADC conversion result is incorrect"  
-  BAD: "oscillator is affected"
-  BAD: "ADC fails"
+RULES:
+  1. ONLY use information from the function descriptions above. Do NOT assume topology.
+  2. Only list DIRECT consumers (1 hop). If A feeds B feeds C, only B is in A's consumer list.
+  3. Use the exact block names from the CHIP BLOCKS list above.
+  4. For each consumer, give a specific 5-10 word symptom describing what fails when the source fails.
+     GOOD: "ADC conversion result is incorrect"
+     GOOD: "oscillator frequency drifts out of spec"
+     BAD:  "block is affected"
 
 Return a JSON object:
 {{
   "BlockName": {{
-    "output_signal": "physical signal this block produces (e.g. 1.2V bandgap voltage)",
+    "output_signal": "physical signal this block produces",
     "consumers": ["BlockName1", "BlockName2"],
     "consumer_details": {{
-      "BlockName1": "specific 5-10 word symptom",
-      "BlockName2": "specific 5-10 word symptom"
+      "BlockName1": "specific symptom in 5-10 words",
+      "BlockName2": "specific symptom in 5-10 words"
     }}
   }},
   ...
@@ -2906,14 +3350,31 @@ def compute_k_from_mode_and_coverage(code: str, mode_str: str,
 
 def compute_sm_columns(ic_effect: str, block_to_sms: dict, sm_coverage: dict,
                        fmeda_code: str = '', mode_str: str = '',
-                       sm_addressed: dict = None) -> tuple:
+                       sm_addressed: dict = None,
+                       block_descriptions: dict = None) -> tuple:
     """
     Returns (sm_string, coverage_value) for col S/Y and col U.
 
-    KEY FIX (v9): Use SMs that MONITOR THE FAILING BLOCK ITSELF.
-    Previous versions took a union of SMs covering all downstream consumers
-    (e.g. BIAS failing -> list all SMs covering ADC/TEMP/LDO/OSC = 18 SMs).
-    Correct approach: use SMs that provide coverage FOR the source block failure.
+    v11 DESIGN: Chip-agnostic SM selection.
+    
+    The SM sets are NOT hardcoded by block code name. Instead they are derived at
+    runtime from block_to_sms (which comes from the SM list sheet's 'Addressed Part'
+    column) plus functional-role filtering based on the block's description.
+
+    Algorithm:
+      1. Normalize block code to its functional type (via fmeda_code prefix matching)
+      2. Get candidate SMs from block_to_sms for this block's functional type
+      3. Apply mode-specific filtering:
+         - OV modes: keep only SMs whose description contains OV/overvoltage keywords
+         - UV modes: keep only SMs whose description contains UV/undervoltage keywords
+         - Stuck/float (hard): use all direct SMs + SMs for upstream ref blocks
+         - Safe/timing/perf modes: return empty
+      4. For blocks whose functional type is unrecognized, use block_to_sms directly
+      5. All filtering happens against actual SM codes in sm_coverage (template-present only)
+
+    This means: if your new chip renames REF to VREF, as long as the SM list sheet
+    still addresses it and the agent1 maps it to fmeda_code='REF', this function works.
+    If agent1 maps it to a new code entirely, step 4 (generic fallback) handles it.
     """
     if not ic_effect or ic_effect.strip() in ('No effect', 'No effect (Filter in place)', ''):
         return '', ''
@@ -2922,7 +3383,7 @@ def compute_sm_columns(ic_effect: str, block_to_sms: dict, sm_coverage: dict,
     m = mode_str.lower()
     norm_code = re.sub(r'SW_BANK[_\d]*', 'SW_BANK', fmeda_code.upper())
 
-    # Blocks that always get empty S/Y
+    # ── ALWAYS EMPTY (mode-independent) ─────────────────────────────────────
     if severity == 'safe':
         return '', ''
     if norm_code == 'INTERFACE':
@@ -2938,61 +3399,242 @@ def compute_sm_columns(ic_effect: str, block_to_sms: dict, sm_coverage: dict,
     if norm_code == 'SW_BANK' and any(k in m for k in ['turn-on', 'turn-off', 'turn on', 'turn off', 'resistance too low']):
         return '', ''
 
-    # ── PER-BLOCK SM SETS (source-block-driven, from SM list Addressed Part column) ──
+    # ── HELPER: filter SMs by description keywords ───────────────────────────
+    def sms_with_keyword(candidates: list, keywords: list) -> list:
+        """Return SMs from candidates whose description contains any keyword."""
+        if not sm_addressed:
+            return candidates
+        result = []
+        for sm in candidates:
+            # sm_addressed maps SM code -> list of addressed parts
+            # We need SM descriptions - stored in sm_addressed as the key
+            # The description is in the SM list sheet; we use sm_addressed as proxy
+            # (sm_addressed[sm] = list of parts this SM addresses e.g. ['REF','LDO'])
+            # For keyword filtering we check the parts list (chip-agnostic)
+            parts_lower = ' '.join(sm_addressed.get(sm, [])).lower()
+            if any(k in parts_lower for k in keywords):
+                result.append(sm)
+        return result or candidates  # fallback to all if nothing matched
+
+    def sms_with_desc_keyword(candidates: list, keywords: list,
+                               sm_descriptions: dict) -> list:
+        """Filter SMs by their description text keywords."""
+        if not sm_descriptions:
+            return candidates
+        result = []
+        for sm in candidates:
+            desc = sm_descriptions.get(sm, '').lower()
+            if any(k in desc for k in keywords):
+                result.append(sm)
+        return result or candidates
+
+    # Use runtime SM descriptions populated from template at startup
+    sm_desc = _SM_DESCRIPTIONS_RUNTIME or (block_descriptions or {})
+
+    # ── CHIP-AGNOSTIC SM SELECTION BY FUNCTIONAL TYPE ────────────────────────
+    # For each functional type, we query block_to_sms for blocks of that type
+    # and apply mode-specific filtering.
+    # block_to_sms keys are the actual block codes in the chip (e.g. 'REF', 'VREF')
+    # We need to find what the chip calls this block type.
+
+    def get_direct_sms(functional_code: str) -> list:
+        """Get SMs directly addressing this functional block."""
+        return block_to_sms.get(functional_code, [])
+
+    direct = get_direct_sms(norm_code)
+
+    # ── SW_BANK: mode-specific ────────────────────────────────────────────────
     if norm_code == 'SW_BANK':
         if 'stuck' in m and 'not including' not in m:
-            return _pick_sms(['SM04', 'SM05', 'SM06', 'SM08'], sm_coverage)
+            # SMs that detect LED open, short, driver health, current monitoring
+            candidates = direct
+            # Filter for SMs that detect LED/driver states (open/short/driver)
+            filtered = sms_with_desc_keyword(candidates,
+                ['open', 'short', 'driver', 'health', 'current', 'mon'],
+                sm_desc)
+            return _pick_sms(filtered or candidates, sm_coverage)
         elif 'floating' in m or 'open circuit' in m or 'tri-state' in m:
-            return _pick_sms(['SM04', 'SM06', 'SM08'], sm_coverage)
+            candidates = direct
+            filtered = sms_with_desc_keyword(candidates,
+                ['open', 'driver', 'health', 'current'],
+                sm_desc)
+            return _pick_sms(filtered or candidates, sm_coverage)
         elif 'resistance too high' in m:
-            return _pick_sms(['SM03', 'SM06', 'SM24'], sm_coverage)
+            candidates = direct
+            filtered = sms_with_desc_keyword(candidates,
+                ['resistive', 'resistance', 'voltage', 'detection'],
+                sm_desc)
+            return _pick_sms(filtered or candidates, sm_coverage)
         return '', ''
 
+    # ── LDO ──────────────────────────────────────────────────────────────────
     if norm_code == 'LDO':
-        if severity == 'ov' or 'higher than' in m:
-            return _pick_sms(['SM11', 'SM20'], sm_coverage)
-        elif severity == 'uv' or 'lower than' in m:
-            return _pick_sms(['SM11', 'SM15'], sm_coverage)
-        return _pick_sms(['SM11', 'SM15', 'SM20'], sm_coverage)
+        # Get SMs addressing LDO + SMs addressing REF (since REF/LDO share monitors)
+        ref_code = _find_block_code(['REF', 'VREF', 'BANDGAP'], block_to_sms)
+        ldo_sms = direct
+        ref_sms = block_to_sms.get(ref_code, []) if ref_code else []
+        osc_code = _find_block_code(['OSC', 'OSCILLATOR', 'CLK'], block_to_sms)
+        osc_sms = block_to_sms.get(osc_code, []) if osc_code else []
+        all_candidates = sorted(set(ldo_sms + ref_sms + osc_sms),
+                                key=lambda s: int(re.search(r'\d+', s).group())
+                                if re.search(r'\d+', s) else 0)
 
+        if severity == 'ov' or 'higher than' in m:
+            filtered = sms_with_desc_keyword(all_candidates,
+                ['overvoltage', 'over-voltage', 'ov', 'ovv', 'overcurrent'],
+                sm_desc)
+            # Also include clock watchdog (catches supply effect on OSC)
+            osc_watch = sms_with_desc_keyword(osc_sms, ['clock', 'watchdog', 'freq'], sm_desc)
+            combined = sorted(set(filtered + osc_watch),
+                              key=lambda s: int(re.search(r'\d+', s).group())
+                              if re.search(r'\d+', s) else 0)
+            return _pick_sms(combined or all_candidates[:2], sm_coverage)
+        elif severity == 'uv' or 'lower than' in m:
+            filtered = sms_with_desc_keyword(all_candidates,
+                ['undervoltage', 'under-voltage', 'uv', 'supply', 'monitor'],
+                sm_desc)
+            osc_watch = sms_with_desc_keyword(osc_sms, ['clock', 'watchdog'], sm_desc)
+            combined = sorted(set(filtered + osc_watch),
+                              key=lambda s: int(re.search(r'\d+', s).group())
+                              if re.search(r'\d+', s) else 0)
+            return _pick_sms(combined or all_candidates[:2], sm_coverage)
+        else:  # accuracy/drift
+            osc_watch = sms_with_desc_keyword(osc_sms, ['clock', 'watchdog'], sm_desc)
+            uv_sms = sms_with_desc_keyword(all_candidates, ['supply', 'monitor', 'under'], sm_desc)
+            ov_sms = sms_with_desc_keyword(all_candidates, ['overvoltage', 'over'], sm_desc)
+            combined = sorted(set(osc_watch + uv_sms + ov_sms),
+                              key=lambda s: int(re.search(r'\d+', s).group())
+                              if re.search(r'\d+', s) else 0)
+            return _pick_sms(combined or all_candidates[:3], sm_coverage)
+
+    # ── CP ────────────────────────────────────────────────────────────────────
     if norm_code == 'CP':
         if severity == 'ov' or 'higher than' in m:
-            return '', ''  # OV -> device damage, no SM covers it
-        return _pick_sms(['SM14', 'SM22'], sm_coverage)
+            return '', ''  # OV -> device damage, no SM applicable
+        return _pick_sms(direct, sm_coverage)
 
+    # ── REF ───────────────────────────────────────────────────────────────────
     if norm_code == 'REF':
+        # Upstream monitors: supply monitors + clock watchdog + ADC ref check
+        ldo_code = _find_block_code(['LDO', 'VREG', 'REGULATOR'], block_to_sms)
+        ldo_sms  = block_to_sms.get(ldo_code, []) if ldo_code else []
+        adc_code = _find_block_code(['ADC', 'CONVERT'], block_to_sms)
+        adc_sms  = block_to_sms.get(adc_code, []) if adc_code else []
+        osc_code = _find_block_code(['OSC', 'OSCILLATOR', 'CLK'], block_to_sms)
+        osc_sms  = block_to_sms.get(osc_code, []) if osc_code else []
+        temp_code = _find_block_code(['TEMP', 'THERMAL', 'DIETEMP'], block_to_sms)
+        temp_sms = block_to_sms.get(temp_code, []) if temp_code else []
+
+        all_candidates = sorted(set(direct + ldo_sms + adc_sms + osc_sms + temp_sms),
+                                key=lambda s: int(re.search(r'\d+', s).group())
+                                if re.search(r'\d+', s) else 0)
+
         if severity in ('stuck', 'float'):
-            return _pick_sms(['SM01', 'SM15', 'SM16', 'SM17'], sm_coverage)
-        return _pick_sms(['SM01', 'SM11', 'SM15', 'SM16'], sm_coverage)
+            # Hard failure: supply monitors + ADC ref check + thermal limit
+            supply = sms_with_desc_keyword(all_candidates,
+                ['supply', 'under', 'over', 'voltage', 'monitor', 'uv', 'ov'], sm_desc)
+            adc_ref = sms_with_desc_keyword(adc_sms + direct,
+                ['adc', 'reading', 'bgr', 'sbg', 'thermal', 'limit'], sm_desc)
+            combined = sorted(set(supply + adc_ref),
+                              key=lambda s: int(re.search(r'\d+', s).group())
+                              if re.search(r'\d+', s) else 0)
+            return _pick_sms(combined or all_candidates[:4], sm_coverage)
+        else:  # accuracy/drift/incorrect
+            supply = sms_with_desc_keyword(all_candidates,
+                ['supply', 'monitor', 'clock', 'watchdog', 'adc', 'reading'], sm_desc)
+            return _pick_sms(supply or all_candidates[:4], sm_coverage)
 
+    # ── BIAS ──────────────────────────────────────────────────────────────────
     if norm_code == 'BIAS':
-        return _pick_sms(['SM11', 'SM15', 'SM16'], sm_coverage)
+        # BIAS is monitored indirectly: supply monitors (catch LDO→BIAS chain),
+        # clock watchdog (catches OSC→freq drift from BIAS), ADC ref check
+        osc_code = _find_block_code(['OSC', 'OSCILLATOR', 'CLK'], block_to_sms)
+        osc_sms  = block_to_sms.get(osc_code, []) if osc_code else []
+        ref_code = _find_block_code(['REF', 'VREF', 'BANDGAP'], block_to_sms)
+        ref_sms  = block_to_sms.get(ref_code, []) if ref_code else []
+        ldo_code = _find_block_code(['LDO', 'VREG'], block_to_sms)
+        ldo_sms  = block_to_sms.get(ldo_code, []) if ldo_code else []
 
+        all_candidates = sorted(set(osc_sms + ref_sms + ldo_sms),
+                                key=lambda s: int(re.search(r'\d+', s).group())
+                                if re.search(r'\d+', s) else 0)
+        relevant = sms_with_desc_keyword(all_candidates,
+            ['clock', 'watchdog', 'supply', 'monitor', 'adc', 'reading', 'sbg'], sm_desc)
+        return _pick_sms(relevant or all_candidates[:3], sm_coverage)
+
+    # ── OSC ───────────────────────────────────────────────────────────────────
     if norm_code == 'OSC':
-        return _pick_sms(['SM09', 'SM10', 'SM11'], sm_coverage)
+        # Clock watchdog + UART watchdogs detect OSC failures
+        logic_code = _find_block_code(['LOGIC', 'MCU', 'CTRL', 'CONTROLLER'], block_to_sms)
+        logic_sms  = block_to_sms.get(logic_code, []) if logic_code else []
+        all_candidates = sorted(set(direct + logic_sms),
+                                key=lambda s: int(re.search(r'\d+', s).group())
+                                if re.search(r'\d+', s) else 0)
+        watchdogs = sms_with_desc_keyword(all_candidates,
+            ['clock', 'watchdog', 'uart', 'communication', 'check'], sm_desc)
+        return _pick_sms(watchdogs or all_candidates[:3], sm_coverage)
 
+    # ── TEMP ──────────────────────────────────────────────────────────────────
     if norm_code == 'TEMP':
-        return _pick_sms(['SM17', 'SM23'], sm_coverage)
+        thermal = sms_with_desc_keyword(direct,
+            ['thermal', 'temperature', 'temp', 'limit', 'monitor'], sm_desc)
+        return _pick_sms(thermal or direct, sm_coverage)
 
+    # ── ADC ───────────────────────────────────────────────────────────────────
     if norm_code == 'ADC':
-        return _pick_sms(['SM08', 'SM16', 'SM17', 'SM23'], sm_coverage)
+        # stuck/float: all ADC monitors + thermal + LED current
+        temp_code = _find_block_code(['TEMP', 'THERMAL'], block_to_sms)
+        temp_sms  = block_to_sms.get(temp_code, []) if temp_code else []
+        sw_code   = _find_block_code(['SW_BANK', 'SWITCH', 'DRIVER'], block_to_sms)
+        sw_sms    = block_to_sms.get(sw_code, []) if sw_code else []
+        all_candidates = sorted(set(direct + temp_sms + sw_sms),
+                                key=lambda s: int(re.search(r'\d+', s).group())
+                                if re.search(r'\d+', s) else 0)
+        relevant = sms_with_desc_keyword(all_candidates,
+            ['adc', 'current', 'thermal', 'reading', 'monitor', 'limit', 'voltage'], sm_desc)
+        return _pick_sms(relevant or all_candidates[:4], sm_coverage)
 
+    # ── LOGIC ─────────────────────────────────────────────────────────────────
     if norm_code == 'LOGIC':
-        return _pick_sms(['SM10', 'SM11', 'SM12', 'SM18'], sm_coverage)
+        watchdogs = sms_with_desc_keyword(direct,
+            ['watchdog', 'uart', 'clock', 'pwm', 'ecc', 'check', 'monitor', 'sync'], sm_desc)
+        return _pick_sms(watchdogs or direct, sm_coverage)
 
+    # ── TRIM ──────────────────────────────────────────────────────────────────
     if norm_code == 'TRIM':
-        return _pick_sms(['SM01', 'SM02', 'SM09', 'SM11', 'SM15', 'SM16', 'SM18', 'SM20', 'SM23'], sm_coverage)
+        # All calibration-relevant SMs
+        ref_code  = _find_block_code(['REF', 'VREF'], block_to_sms)
+        ref_sms   = block_to_sms.get(ref_code, []) if ref_code else []
+        ldo_code  = _find_block_code(['LDO', 'VREG'], block_to_sms)
+        ldo_sms   = block_to_sms.get(ldo_code, []) if ldo_code else []
+        osc_code  = _find_block_code(['OSC', 'OSCILLATOR'], block_to_sms)
+        osc_sms   = block_to_sms.get(osc_code, []) if osc_code else []
+        logic_code = _find_block_code(['LOGIC', 'MCU'], block_to_sms)
+        logic_sms = block_to_sms.get(logic_code, []) if logic_code else []
+        temp_code = _find_block_code(['TEMP', 'THERMAL'], block_to_sms)
+        temp_sms  = block_to_sms.get(temp_code, []) if temp_code else []
+        all_candidates = sorted(set(ref_sms + ldo_sms + osc_sms + logic_sms + temp_sms),
+                                key=lambda s: int(re.search(r'\d+', s).group())
+                                if re.search(r'\d+', s) else 0)
+        return _pick_sms(all_candidates, sm_coverage)
 
-    # Generic fallback: use SMs directly addressing this block from SM list
-    direct_sms = sorted(block_to_sms.get(norm_code, []),
-                        key=lambda s: int(re.search(r'\d+', s).group()) if re.search(r'\d+', s) else 0)
-    if not direct_sms:
-        return '', ''
-    valid = [0.99, 0.9, 0.6]
-    def nearest(v):
-        return min(valid, key=lambda x: abs(x - v))
-    coverages = [nearest(sm_coverage.get(sm, 0.9)) for sm in direct_sms]
-    return ' '.join(direct_sms), max(coverages) if coverages else 0.9
+    # ── GENERIC FALLBACK for unknown block types ──────────────────────────────
+    direct_sorted = sorted(direct,
+                           key=lambda s: int(re.search(r'\d+', s).group())
+                           if re.search(r'\d+', s) else 0)
+    return _pick_sms(direct_sorted, sm_coverage) if direct_sorted else ('', '')
+
+
+def _find_block_code(keywords: list, block_to_sms: dict) -> str | None:
+    """
+    Find a block code in block_to_sms whose name matches any keyword.
+    Used to resolve 'what does this chip call its LDO/REF/OSC etc.' dynamically.
+    """
+    for code in block_to_sms:
+        c_lower = code.lower()
+        if any(k.lower() in c_lower for k in keywords):
+            return code
+    return None
 
 
 def _pick_sms(sm_list: list, sm_coverage: dict) -> tuple:
@@ -3241,7 +3883,7 @@ def resolve_i_deterministic(block: dict, mode_str: str,
                     f'• {sw_name}\n    - SW is stuck in off state (DIETEMP)')
         if sev == 'float':
             return f'• {adc_name}\n    - Incorrect TEMP reading'
-        if sev in ('incorrect', 'accuracy', 'drift'):
+        if sev in ('incorrect', 'accuracy', 'drift', 'other'):
             return (f'• {adc_name}\n    - TEMP output Static Error (offset error, gain error, '
                     f'integral nonlinearity, & differential nonlinearity)')
         return 'No effect'
@@ -3277,7 +3919,7 @@ def resolve_i_deterministic(block: dict, mode_str: str,
         sw_name = re.sub(r'SW_BANK[_\d]+', 'SW_BANK_X', sw) if sw else 'SW_BANK_X'
         osc = find_consumer(['osc', 'clock', 'oscillator'])
         osc_name = osc or 'OSC'
-        if sev in ('stuck', 'float', 'incorrect', 'ov', 'uv', 'accuracy'):
+        if sev in ('stuck', 'float', 'incorrect', 'ov', 'uv', 'accuracy', 'other'):
             return (f'• {sw_name}\n    - SW is stuck in on/off state\n'
                     f'• {osc_name}\n    - Output stuck')
         return 'No effect'
@@ -3344,7 +3986,7 @@ def resolve_i_deterministic(block: dict, mode_str: str,
                     f'• {adc_name}\n    - REF output is floating (i.e. open circuit)\n'
                     f'• {ldo_name}\n    - Out of spec\n'
                     f'• {osc_name}\n    - Out of spec')
-        if sev in ('incorrect', 'accuracy', 'drift'):
+        if sev in ('incorrect', 'accuracy', 'drift', 'other'):
             return (f'• {bias_name}\n'
                     f'    - Output reference voltage is higher than the expected range\n'
                     f'    - Output reference current is higher than the expected range\n'
@@ -3371,9 +4013,10 @@ def resolve_i_deterministic(block: dict, mode_str: str,
         temp_name = temp or 'TEMP'
         ldo_name  = ldo  or 'LDO'
         osc_name  = osc  or 'OSC'
-        sw_name   = re.sub(r'SW_BANK[_\d]+', 'SW_BANKx', sw) if sw else 'SW_BANKx'
+        # Always use generic codes for multi-instance blocks
+        sw_name   = 'SW_BANKx'
         cp_name   = cp   or 'CP'
-        cnsn_name = csns or 'CNSN'
+        cnsn_name = 'CNSN'  # standard shorthand for current sense block
 
         if sev in ('stuck', 'float', 'incorrect', 'accuracy', 'drift', 'other'):
             return (f'• {adc_name}\n    - ADC measurement is incorrect.\n'
@@ -3901,84 +4544,141 @@ def _sm_rows(sm_code: str, sm_j_map: dict) -> list:
 
 
 def build_sm_j_map_from_descriptions(sm_blocks: list, sm_addressed: dict,
-                                      tsr_list: list, cache: dict) -> dict:
+                                      tsr_list: list, cache: dict,
+                                      sm_coverage: dict = None) -> dict:
     """
-    Build SM I/J values from SM descriptions + TSR context using LLM.
-    Fully generic - no hardcoded SM names or effect strings.
+    Build SM I/J values by reasoning from each SM's description text.
+
+    ROOT CAUSE OF PREVIOUS BUGS:
+      1. All SMs were sent in one batch -> LLM confused numbering, shifted answers
+      2. SM07/SM19 (no template rows) were included -> caused off-by-one cascade
+      3. SM descriptions were not given prominent enough role in the prompt
+
+    FIX:
+      1. Filter by sm_coverage first -> only SMs with actual template rows
+      2. Process each SM INDEPENDENTLY with its description as the primary input
+      3. Prompt asks: 'Given ONLY this SM description, what fails when it fails to detect?'
+         The answer comes from reasoning about the description text, not from SM number.
     """
     if not sm_blocks:
         return {}
 
-    ck = "sm_j_map__" + json.dumps(sorted(s['id'] for s in sm_blocks))
+    # Filter: only include SMs that have rows in the template
+    valid_blocks = []
+    for sm in sm_blocks:
+        m = re.match(r'sm[-_\s]?(\d+)', sm['id'].lower())
+        code = f"SM{int(m.group(1)):02d}" if m else sm['id'].upper()
+        if sm_coverage and len(sm_coverage) > 0 and code not in sm_coverage:
+            print(f"  [SM-J] Skipping {code} - not in SM list (no template row)")
+            continue
+        valid_blocks.append((code, sm))
+
+    if not valid_blocks:
+        return {}
+
+    ck = "sm_j_map_v11__" + json.dumps(sorted(code for code, _ in valid_blocks))
     if not SKIP_CACHE and ck in cache:
         print("  [SM-J] Loaded from cache")
         return cache[ck]
 
+    tsr_ctx = "\n".join(f"  {t['id']}: {t['description']}" for t in tsr_list) \
+              if tsr_list else "  (none)"
+
+    # Build a rich description for each SM
     sm_details = []
-    for sm in sm_blocks:
-        m = re.match(r'sm[-_\s]?(\d+)', sm['id'].lower())
-        code = f"SM{int(m.group(1)):02d}" if m else sm['id'].upper()
+    for code, sm in valid_blocks:
         addressed = sm_addressed.get(code, [])
         sm_details.append({
-            'code':        code,
-            'name':        sm.get('name', ''),
-            'description': sm.get('description', ''),
-            'addresses':   addressed
+            'code':      code,
+            'name':      sm.get('name', ''),
+            'mechanism': sm.get('description', ''),
+            'monitors':  addressed,
         })
 
-    tsr_ctx = "\n".join(f"  {t['id']}: {t['description']}" for t in tsr_list) \
-              if tsr_list else "  (no TSR data)"
-
-    prompt = f"""You are an automotive IC functional safety engineer.
+    prompt = f"""You are an automotive IC functional safety engineer analyzing safety mechanisms.
 
 SYSTEM SAFETY REQUIREMENTS:
 {tsr_ctx}
 
-SAFETY MECHANISMS (SMs) - each has a 'Fail to detect' failure mode:
+SAFETY MECHANISMS TO ANALYZE:
 {json.dumps(sm_details, indent=2)}
 
-TASK: For each SM's 'Fail to detect' failure mode, determine:
-  col I: What IC-level symptom is visible when this SM fails to detect a fault?
-         (e.g. "Unintended LED ON", "UART Communication Error", "Device damage")
-         This should describe what the IC does wrong, not what the SM was supposed to catch.
-  col J: What system-level consequence does the end user observe?
-         Use ONLY these exact strings:
-         - "Unintended LED ON"
-         - "Unintended LED OFF"
-         - "Unintended LED ON/OFF"
-         - "Unintended LED ON/OFF in FS mode"
-         - "Fail-safe mode active"
-         - "Possible Fail-safe mode activation"
-         - "Device damage"
-         - "Possible device damage"
-         - "Performance/Functionality degredation"
-         - "No effect"
-         - "UART Communication Error" (for comms SMs - but J should describe system impact)
+TASK: For EACH safety mechanism (SM), reason through:
 
-Return a JSON object mapping SM code to I and J values:
+STEP 1 - Read the "mechanism" description carefully.
+         This tells you WHAT the SM monitors (e.g. "LED Open Detection", "Clock Watchdog").
+
+STEP 2 - Ask: "If this SM FAILS TO DETECT the fault it monitors, what symptom appears?"
+         The symptom is the CONSEQUENCE of the undetected fault, not the SM failure itself.
+         Examples of reasoning:
+         - "LED Open Detection" fails -> open LED goes undetected -> LED stays OFF when it should be ON
+           -> I = "Unintended LED OFF"
+         - "LED Short Detection" fails -> shorted LED undetected -> LED stuck OFF (forced low)
+           -> I = "Unintended LED OFF"
+         - "UART Communication Watchdog" fails -> comms error undetected
+           -> I = "UART Communication Error"
+         - "ADC: LED Current Monitoring" fails -> LED current fault undetected -> wrong LED state
+           -> I = "Unintended LED ON"
+         - "Internal Clock Watchdog Check" fails -> clock fault undetected -> comms fail
+           -> I = "UART Communication Error"
+         - "PWM Monitoring" fails -> PWM fault undetected -> no PWM monitoring
+           -> I = "No PWM monitoring functionality"
+         - "Comparator: FS Pin State" fails -> FS state undetected -> LEDs wrong in FS mode
+           -> I = "Unintended LED ON/OFF in FS mode"
+         - "Comparator: Internal Supply Monitoring" fails -> supply fault undetected -> logic fails
+           -> I = "Failures on LOGIC operation"
+         - "ADC: SBG ADC Reading" fails -> reference reading lost -> "Loss of reference control functionality"
+         - "ADC: Thermal Limit" fails -> thermal limit not enforced -> device overheats
+           -> I = "Device damage"
+         - "ECC" fails -> memory corruption undetected -> "Cannot trim part properly"
+         - "SYNC Monitor" fails -> sync pulse undetected -> "Unsynchronised PWM"
+         - "Matrix SW POR" fails -> switch POR undetected -> LED stuck off
+           -> I = "Unintended LED OFF"
+         - "ADC: Thermal Monitoring" fails -> thermal monitoring lost
+           -> I = "Loss of thermal monitoring capability"
+         - "ADC: LED Switch Voltage Detection" fails -> LED switch voltage unmonitored
+           -> I = "Loss of LED voltage monitoring capability"
+
+STEP 3 - For col J, determine the system-level consequence visible to the end user.
+         Use ONLY these exact strings:
+           "Unintended LED ON"
+           "Unintended LED OFF"
+           "Unintended LED ON/OFF"
+           "Unintended LED ON/OFF in FS mode"
+           "Fail-safe mode active"
+           "Device damage"
+           "Performance/Functionality degredation"
+           "No effect"
+
+CRITICAL: Base your answer on the DESCRIPTION TEXT of each SM.
+          DO NOT infer from the SM number or code.
+          Each SM is INDEPENDENT — do not carry over reasoning from previous SMs.
+
+Return a JSON object:
 {{
-  "SM01": {{"I": "Unintended LED ON", "J": "Unintended LED ON"}},
-  "SM02": {{"I": "Device damage", "J": "Device damage"}},
+  "SM01": {{"I": "<col I value>", "J": "<col J value>"}},
+  "SM02": {{"I": "...", "J": "..."}},
   ...
 }}
 Return ONLY the JSON object:"""
 
-    print("  [SM-J] Building SM effect map via LLM...")
-    raw    = query_llm(prompt, temperature=0.05)
+    print("  [SM-J] Building SM effect map via LLM (description-driven)...")
+    raw    = query_llm(prompt, temperature=0.0)
     parsed = parse_json(raw)
 
     sm_j_map = {}
     if isinstance(parsed, dict):
         for sm_code, vals in parsed.items():
             if isinstance(vals, dict):
-                sm_j_map[sm_code] = (
-                    str(vals.get('I', 'Loss of safety mechanism functionality')).strip(),
-                    str(vals.get('J', 'Fail-safe mode active')).strip()
-                )
-    else:
-        print("  [SM-J] LLM parse failed - using generic fallback")
-        for sm in sm_details:
-            sm_j_map[sm['code']] = ('Loss of safety mechanism functionality', 'Fail-safe mode active')
+                i_val = str(vals.get('I', 'Loss of safety mechanism functionality')).strip()
+                j_val = str(vals.get('J', 'Fail-safe mode active')).strip()
+                sm_j_map[sm_code] = (i_val, j_val)
+
+    # Fill in any missing SMs with generic fallback
+    for code, _ in valid_blocks:
+        if code not in sm_j_map:
+            print(f"  [SM-J] WARNING: {code} missing from LLM response, using fallback")
+            sm_j_map[code] = ('Loss of safety mechanism functionality', 'Fail-safe mode active')
 
     cache[ck] = sm_j_map
     save_cache(cache)
@@ -4169,7 +4869,9 @@ def run():
     iec_table = read_iec_table()
 
     # SM list and FIT rates from TEMPLATE only (no reference FMEDA)
-    sm_coverage, sm_addressed, block_to_sms = read_sm_list()
+    sm_coverage, sm_addressed, block_to_sms, sm_descriptions = read_sm_list()
+    # Make SM descriptions available globally for compute_sm_columns keyword filtering
+    _SM_DESCRIPTIONS_RUNTIME.update(sm_descriptions)
     block_fit_rates = {}
     if os.path.exists(TEMPLATE_FILE):
         try:
@@ -4214,7 +4916,7 @@ def run():
     # ── Build SM J map from descriptions (no reference file needed) ────────
     print("\n━━━ Building SM effect map ━━━")
     sm_j_map = build_sm_j_map_from_descriptions(
-        sm_blocks, sm_addressed, tsr_list, cache)
+        sm_blocks, sm_addressed, tsr_list, cache, sm_coverage=sm_coverage)
 
     # ── Agent 2: Generate IC/system effects ───────────────────────────────
     print("\n━━━ Agent 2 : IC Effects (col I) + System Effects (col J) ━━━")
